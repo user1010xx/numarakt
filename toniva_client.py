@@ -53,30 +53,50 @@ _PHONE_KEYS = (
     "dst",
     "src",
 )
-_DATE_KEYS = (
-    "tarih",
-    "TARİH",
-    "Tarih",
-    "date",
+# Tam tarih+saat veya yalnızca tarih taşıyabilen alanlar (öncelik sırası)
+_DATETIME_KEYS = (
+    "calldate",  # FreePBX / Asterisk CDR — en sık
     "callDate",
     "call_date",
+    "callDateTime",
+    "call_datetime",
     "startedAt",
     "started_at",
     "startTime",
     "start_time",
+    "startAt",
+    "start_at",
     "createdAt",
     "created_at",
-    "datetime",
+    "eventTime",
+    "event_time",
     "timestamp",
+    "datetime",
+    "dateTime",
+    "begin",
+    "start",
+    "ts",
 )
-_TIME_KEYS = (
+_DATE_ONLY_KEYS = (
+    "tarih",
+    "TARİH",
+    "Tarih",
+    "date",
+    "day",
+    "callDay",
+    "call_day",
+)
+_TIME_ONLY_KEYS = (
     "saat",
     "SAAT",
     "Saat",
-    "time",
     "callTime",
     "call_time",
-    "hour",
+    "timeOfDay",
+    "time_of_day",
+    "clock",
+    # bare "time" en sonda — API bazen time=0 (süre) gönderiyor, saat değil
+    "time",
 )
 # Yalnızca görüşme süresi — çaldırma / ring alanları KASITLI olarak yok
 _TALK_DURATION_KEYS = (
@@ -336,16 +356,17 @@ class TonivaClient:
             return None
 
         agent = self._pick(row, _AGENT_KEYS)
+        if agent is None:
+            # FreePBX / CDR
+            agent = self._pick(row, ("cnam", "CNAM", "agentname", "memberName", "member_name"))
         agent_str = str(agent).strip() if agent is not None else "—"
         if not agent_str:
             agent_str = "—"
 
-        date_raw = self._pick(row, _DATE_KEYS)
-        time_raw = self._pick(row, _TIME_KEYS)
         talk_raw = self._pick(row, _TALK_DURATION_KEYS)
-
-        sort_dt, date_disp, time_disp = self._resolve_datetime(date_raw, time_raw)
         talk_seconds = self._parse_duration_seconds(talk_raw)
+
+        sort_dt, date_disp, time_disp = self._extract_datetime(row)
 
         display_phone = normalize_tr_phone(phone_str) or digits_keep(phone_str)
 
@@ -357,6 +378,147 @@ class TonivaClient:
             talk_seconds=talk_seconds,
             sort_key=sort_dt,
         )
+
+    @classmethod
+    def _extract_datetime(cls, row: dict[str, Any]) -> tuple[datetime, str, str]:
+        """
+        Satırdan tarih+saat çıkar.
+
+        Hata kaynağı (canlı): API bazen `time: 0` (süre) döndürür; bu saat değildir.
+        Gerçek an genelde `calldate` / `startedAt` / birleşik ISO alandadır.
+        """
+        # 1) Tek alanda tam datetime
+        for key in _DATETIME_KEYS:
+            raw = cls._pick(row, (key,))
+            if raw is None:
+                continue
+            parsed = cls._try_parse_single_datetime(raw)
+            if parsed is not None:
+                return parsed
+
+        # 2) Ayrı tarih + saat alanları (saat doğrulanır)
+        date_raw = cls._pick(row, _DATE_ONLY_KEYS)
+        time_raw = cls._pick_valid_clock(row, _TIME_ONLY_KEYS)
+        resolved = cls._resolve_datetime(date_raw, time_raw)
+        if resolved[0] != datetime.min:
+            return resolved
+
+        # 3) Heuristik: tüm alanlarda tarih/datetime benzeri değer tara
+        for key, val in row.items():
+            if val in (None, "", 0, "0"):
+                continue
+            fk = cls._fold_key(str(key))
+            # süre / ring alanlarını atla
+            if any(
+                x in fk
+                for x in (
+                    "duration",
+                    "sure",
+                    "suresi",
+                    "ring",
+                    "caldirma",
+                    "billsec",
+                    "talk",
+                    "gorusme",
+                )
+            ):
+                continue
+            if any(
+                x in fk
+                for x in (
+                    "date",
+                    "time",
+                    "tarih",
+                    "saat",
+                    "start",
+                    "created",
+                    "call",
+                    "ts",
+                    "stamp",
+                )
+            ):
+                parsed = cls._try_parse_single_datetime(val)
+                if parsed is not None:
+                    return parsed
+                # yalnızca tarih string + ayrı saat
+                if isinstance(val, str) and _parse_date_only(val.strip()):
+                    t2 = cls._pick_valid_clock(row, _TIME_ONLY_KEYS)
+                    resolved = cls._resolve_datetime(val, t2)
+                    if resolved[0] != datetime.min:
+                        return resolved
+
+        # 4) Son çare: bilinen ayrı alanlar ham
+        return cls._resolve_datetime(date_raw, time_raw)
+
+    @classmethod
+    def _pick_valid_clock(cls, row: dict[str, Any], keys: tuple[str, ...]) -> Any:
+        """Saat alanı: '0' / 0 / süre saniyesi gibi değerleri reddet."""
+        for k in keys:
+            raw = cls._pick(row, (k,))
+            if raw is None:
+                continue
+            if cls._is_plausible_clock(raw):
+                return raw
+        return None
+
+    @staticmethod
+    def _is_plausible_clock(raw: Any) -> bool:
+        if raw is None or raw == "":
+            return False
+        if isinstance(raw, bool):
+            return False
+        # Düz 0 veya küçük tam sayı = süre/flag, saat değil
+        if isinstance(raw, (int, float)):
+            # epoch saat değil; büyük timestamp datetime tarafında ele alınır
+            return False
+        s = str(raw).strip()
+        if not s or s in ("0", "0.0", "-", "—", "–"):
+            return False
+        if re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", s):
+            return True
+        return False
+
+    @classmethod
+    def _try_parse_single_datetime(cls, raw: Any) -> tuple[datetime, str, str] | None:
+        if raw is None or raw == "" or raw in ("-", "—", "–"):
+            return None
+
+        if isinstance(raw, bool):
+            return None
+
+        if isinstance(raw, datetime):
+            dt = raw.replace(tzinfo=None) if raw.tzinfo else raw
+            return dt, dt.strftime("%d.%m.%Y"), dt.strftime("%H:%M:%S")
+
+        if isinstance(raw, date) and not isinstance(raw, datetime):
+            dt = datetime.combine(raw, time(0, 0, 0))
+            return dt, dt.strftime("%d.%m.%Y"), "00:00:00"
+
+        if isinstance(raw, (int, float)):
+            ts = float(raw)
+            # çok küçük sayılar süre/flag — datetime değil
+            if ts < 1_000_000_000:  # ~2001 öncesi epoch altı eşiği
+                return None
+            if ts > 1e12:
+                ts /= 1000.0
+            try:
+                dt = datetime.fromtimestamp(ts)
+                return dt, dt.strftime("%d.%m.%Y"), dt.strftime("%H:%M:%S")
+            except (OSError, OverflowError, ValueError):
+                return None
+
+        s = str(raw).strip()
+        if not s or s in ("0", "None"):
+            return None
+
+        # Yalnızca saat string'i tek başına datetime sayılmaz
+        if re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", s):
+            return None
+
+        resolved = cls._resolve_datetime(s, None)
+        if resolved[0] != datetime.min:
+            return resolved
+        return None
 
     @staticmethod
     def _fold_key(key: str) -> str:
