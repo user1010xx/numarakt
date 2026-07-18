@@ -103,7 +103,7 @@ _TIME_ONLY_KEYS = (
     # bare "time" en sonda — API bazen time=0 (süre) gönderiyor, saat değil
     "time",
 )
-# Yalnızca görüşme süresi — çaldırma / ring alanları KASITLI olarak yok
+# Görüşme (talk) — çaldırma/ring YOK. Önce spesifik, sonda genel.
 _TALK_DURATION_KEYS = (
     "gorusmeSuresi",
     "görüşmeSüresi",
@@ -112,20 +112,57 @@ _TALK_DURATION_KEYS = (
     "Görüşme Süresi",
     "talkDuration",
     "talk_duration",
+    "talkSec",
+    "talk_sec",
+    "talkSeconds",
+    "talk_seconds",
     "billsec",
     "billSec",
+    "bill_sec",
+    "billedSeconds",
     "answeredDuration",
     "answered_duration",
+    "answeredSec",
+    "answered_sec",
+    "answerSec",
+    "answer_sec",
     "conversationDuration",
     "conversation_duration",
     "talkTime",
     "talk_time",
     "connectedDuration",
     "connected_duration",
-    # Genel isimler en sonda (ring/total ile karışma riski)
+    "connectedSec",
+    "connected_sec",
+)
+# Toplam çağrı süresi (ring+talk olabilir) — yalnızca yedek
+_TOTAL_DURATION_KEYS = (
     "callDuration",
     "call_duration",
+    "totalDuration",
+    "total_duration",
     "duration",
+    "totalSec",
+    "total_sec",
+)
+# Çaldırma — görüşmeden düşmek için
+_RING_DURATION_KEYS = (
+    "caldirmaSuresi",
+    "çaldırmaSüresi",
+    "caldirma_suresi",
+    "ÇALDIRMA SÜRESİ",
+    "ringDuration",
+    "ring_duration",
+    "ringSec",
+    "ring_sec",
+    "ringSeconds",
+    "ring_seconds",
+    "ringTime",
+    "ring_time",
+    "ringingDuration",
+    "ringing_duration",
+    "waitDuration",
+    "wait_duration",
 )
 
 
@@ -381,8 +418,7 @@ class TonivaClient:
         if not agent_str:
             agent_str = "—"
 
-        talk_raw = self._pick(row, _TALK_DURATION_KEYS)
-        talk_seconds = self._parse_duration_seconds(talk_raw)
+        talk_seconds = self._extract_talk_seconds(row)
 
         sort_dt, date_disp, time_disp = self._extract_datetime(row)
 
@@ -660,6 +696,109 @@ class TonivaClient:
             if v not in (None, ""):
                 return v
         return None
+
+    @classmethod
+    def _pick_all_present(cls, row: dict[str, Any], keys: tuple[str, ...]) -> list[Any]:
+        """Anahtar listesindeki tüm mevcut değerler (0 dahil; boş string hariç)."""
+        found: list[Any] = []
+        seen: set[int] = set()
+        folded_map = {cls._fold_key(k): v for k, v in row.items()}
+        for k in keys:
+            if k in row and row[k] not in (None, ""):
+                vid = id(row[k])
+                if vid not in seen:
+                    seen.add(vid)
+                    found.append(row[k])
+                continue
+            v = folded_map.get(cls._fold_key(k))
+            if v not in (None, ""):
+                vid = id(v)
+                if vid not in seen:
+                    seen.add(vid)
+                    found.append(v)
+        return found
+
+    @classmethod
+    def _extract_talk_seconds(cls, row: dict[str, Any]) -> int:
+        """
+        Görüşme süresi (sn). Çaldırma ile karıştırılmaz.
+
+        Önemli: API bazen talkDuration/billsec=0 yazar ama asıl süre
+        başka alanda (veya duration - ring) durur. İlk 0'da durma.
+        """
+        # 1) Spesifik talk alanları — ilk sıfırdan büyük değer
+        for raw in cls._pick_all_present(row, _TALK_DURATION_KEYS):
+            sec = cls._parse_duration_seconds(raw)
+            if sec > 0:
+                return sec
+
+        # 2) Heuristik: gorusme / talk / billsec / answer / connected
+        for key, val in row.items():
+            if val in (None, ""):
+                continue
+            fk = cls._fold_key(str(key))
+            if cls._is_ring_like_key(fk):
+                continue
+            if not any(
+                x in fk
+                for x in (
+                    "gorusme",
+                    "talk",
+                    "billsec",
+                    "bill",
+                    "answer",
+                    "connected",
+                    "conversation",
+                )
+            ):
+                continue
+            sec = cls._parse_duration_seconds(val)
+            if sec > 0:
+                return sec
+
+        ring = 0
+        for raw in cls._pick_all_present(row, _RING_DURATION_KEYS):
+            ring = max(ring, cls._parse_duration_seconds(raw))
+        # Heuristik ring
+        for key, val in row.items():
+            if val in (None, ""):
+                continue
+            fk = cls._fold_key(str(key))
+            if cls._is_ring_like_key(fk):
+                ring = max(ring, cls._parse_duration_seconds(val))
+
+        total = 0
+        for raw in cls._pick_all_present(row, _TOTAL_DURATION_KEYS):
+            total = max(total, cls._parse_duration_seconds(raw))
+        # Heuristik: duration / sure (ring değil)
+        for key, val in row.items():
+            if val in (None, ""):
+                continue
+            fk = cls._fold_key(str(key))
+            if cls._is_ring_like_key(fk):
+                continue
+            if "duration" in fk or "sure" in fk or fk.endswith("sec"):
+                if any(x in fk for x in ("wait", "hold", "queue")):
+                    continue
+                total = max(total, cls._parse_duration_seconds(val))
+
+        # 3) FreePBX tarzı: duration=toplam, görüşme ≈ total - ring
+        if total > 0 and ring > 0:
+            if total > ring:
+                return total - ring
+            # total == ring → cevaplanmamış / görüşme yok
+            return 0
+        if total > 0:
+            return total
+
+        return 0
+
+    @staticmethod
+    def _is_ring_like_key(folded_key: str) -> bool:
+        return any(
+            x in folded_key
+            for x in ("ring", "caldir", "waiting", "hold", "queuewait")
+        )
 
     @staticmethod
     def _resolve_datetime(
