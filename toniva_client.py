@@ -134,6 +134,22 @@ _TALK_DURATION_KEYS = (
     "connected_duration",
     "connectedSec",
     "connected_sec",
+    "bridgeDuration",
+    "bridge_duration",
+    "bridgeTime",
+    "bridge_time",
+    "bridgeSec",
+    "bridge_sec",
+    "speakingDuration",
+    "speaking_duration",
+    "handleTime",
+    "handle_time",
+    "serviceTime",
+    "service_time",
+    "inCallDuration",
+    "in_call_duration",
+    "activeDuration",
+    "active_duration",
 )
 # Toplam çağrı süresi (ring+talk olabilir) — yalnızca yedek
 _TOTAL_DURATION_KEYS = (
@@ -144,6 +160,8 @@ _TOTAL_DURATION_KEYS = (
     "duration",
     "totalSec",
     "total_sec",
+    "length",
+    "len",
 )
 # Çaldırma — görüşmeden düşmek için
 _RING_DURATION_KEYS = (
@@ -161,6 +179,8 @@ _RING_DURATION_KEYS = (
     "ring_time",
     "ringingDuration",
     "ringing_duration",
+    "ringingTime",
+    "ringing_time",
     "waitDuration",
     "wait_duration",
 )
@@ -219,25 +239,29 @@ class TonivaClient:
             )
             return None
 
-        matches: list[CallRecord] = []
+        matches: list[tuple[CallRecord, dict[str, Any]]] = []
         parsed = 0
 
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            rec = self._parse_row(row)
+            flat = self._flatten_row(row)
+            rec = self._parse_row(flat)
             if rec is None:
                 continue
             parsed += 1
             if phones_equal(rec.phone, target):
-                matches.append(rec)
+                matches.append((rec, flat))
 
         if parsed == 0:
-            sample = rows[0] if isinstance(rows[0], dict) else {}
-            keys = list(sample.keys()) if isinstance(sample, dict) else []
+            sample = rows[0] if rows else {}
+            if isinstance(sample, dict):
+                keys = list(self._flatten_row(sample).keys())
+            else:
+                keys = [f"row_type={type(sample).__name__}"]
             raise RuntimeError(
                 "Toniva satırları geldi ama telefon alanı okunamadı. "
-                f"Örnek alan adları: {keys[:20]}. "
+                f"Örnek alan adları: {keys[:30]}. "
                 "toniva_client alan eşlemesi güncellenmeli."
             )
 
@@ -251,19 +275,25 @@ class TonivaClient:
             return None
 
         # Aynı numarayı birden fazla personel aramış olabilir → en son arama
-        # (tarih+saat sort_key en büyük olan; eşitlikte listedeki son kayıt)
-        latest = max(
+        idx, (latest, raw) = max(
             enumerate(matches),
-            key=lambda pair: (pair[1].sort_key, pair[0]),
-        )[1]
+            key=lambda pair: (pair[1][0].sort_key, pair[0]),
+        )
         logger.info(
-            "En son arama seçildi: phone=%s agent=%s at=%s %s (eşleşme=%s)",
+            "En son arama seçildi: phone=%s agent=%s at=%s %s talk=%ss (eşleşme=%s)",
             latest.phone,
             latest.agent_name,
             latest.call_date,
             latest.call_time,
+            latest.talk_seconds,
             len(matches),
         )
+        if latest.talk_seconds == 0:
+            # Railway log — alan adını net görmek için
+            logger.warning(
+                "talk=0 ham satır alanları: %s",
+                {k: raw.get(k) for k in list(raw.keys())[:40]},
+            )
         return latest
 
     async def fetch_conversations(self, start: date, end: date) -> list[dict[str, Any]]:
@@ -365,25 +395,71 @@ class TonivaClient:
         if data is None:
             return []
         if isinstance(data, list):
-            return [r for r in data if isinstance(r, dict)]
+            return TonivaClient._normalize_row_list(data, columns=None)
         if not isinstance(data, dict):
             return []
+
+        meta = data.get("meta") or data.get("metadata") or {}
+        columns = None
+        if isinstance(meta, dict):
+            columns = meta.get("columns") or meta.get("fields") or meta.get("headers")
 
         for key in ("rows", "data", "items", "results", "records", "conversations"):
             val = data.get(key)
             if isinstance(val, list):
-                return [r for r in val if isinstance(r, dict)]
+                return TonivaClient._normalize_row_list(val, columns)
             if isinstance(val, dict):
                 for inner in ("rows", "data", "items", "results"):
                     if isinstance(val.get(inner), list):
-                        return [r for r in val[inner] if isinstance(r, dict)]
+                        return TonivaClient._normalize_row_list(val[inner], columns)
 
-        # { "report": { "rows": [...] } }
         report = data.get("report")
         if isinstance(report, dict):
             return TonivaClient._extract_rows(report)
 
         return []
+
+    @staticmethod
+    def _normalize_row_list(
+        rows: list[Any],
+        columns: Any,
+    ) -> list[dict[str, Any]]:
+        """Dict satırlar + [col...] / list satır birleşimi."""
+        col_names: list[str] | None = None
+        if isinstance(columns, list) and columns:
+            col_names = [str(c) for c in columns]
+        elif isinstance(columns, dict):
+            # {0: "phone", 1: "date"} veya {"fields": [...]}
+            if "fields" in columns and isinstance(columns["fields"], list):
+                col_names = [str(c) for c in columns["fields"]]
+
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            if isinstance(r, dict):
+                out.append(r)
+                continue
+            if isinstance(r, (list, tuple)) and col_names:
+                n = min(len(col_names), len(r))
+                out.append({col_names[i]: r[i] for i in range(n)})
+        return out
+
+    @classmethod
+    def _flatten_row(cls, row: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+        """İç içe dict'leri tek düzeye indir (stats.talk → stats_talk / talk)."""
+        flat: dict[str, Any] = {}
+        for k, v in row.items():
+            key = f"{prefix}{k}" if not prefix else f"{prefix}_{k}"
+            if isinstance(v, dict):
+                flat[key] = v  # üst anahtar da dursun
+                nested = cls._flatten_row(v, prefix=str(k))
+                flat.update(nested)
+                # kısa adlar: iç key'ler üstte de erişilebilir olsun
+                for nk, nv in v.items():
+                    if not isinstance(nv, (dict, list)):
+                        flat.setdefault(str(nk), nv)
+            else:
+                flat[key if prefix else str(k)] = v
+        return flat
 
     @staticmethod
     def _extract_meta(data: Any) -> dict[str, Any]:
@@ -723,81 +799,259 @@ class TonivaClient:
         """
         Görüşme süresi (sn). Çaldırma ile karıştırılmaz.
 
-        Önemli: API bazen talkDuration/billsec=0 yazar ama asıl süre
-        başka alanda (veya duration - ring) durur. İlk 0'da durma.
+        Canlı hata: personel/tarih/saat geliyor, talk=0.
+        → Süre alanı ya farklı isimde, ya nested, ya da 00:MM:SS taraması şart.
         """
-        # 1) Spesifik talk alanları — ilk sıfırdan büyük değer
+        # 1) Spesifik talk alanları — sıfırları atla
         for raw in cls._pick_all_present(row, _TALK_DURATION_KEYS):
             sec = cls._parse_duration_seconds(raw)
             if sec > 0:
                 return sec
 
-        # 2) Heuristik: gorusme / talk / billsec / answer / connected
+        # 2) Heuristik talk-benzeri anahtarlar
+        talk_hint = (
+            "gorusme",
+            "talk",
+            "billsec",
+            "bill",
+            "answer",
+            "connected",
+            "conversation",
+            "bridge",
+            "speaking",
+            "handle",
+            "service",
+            "incall",
+            "active",
+        )
         for key, val in row.items():
             if val in (None, ""):
                 continue
             fk = cls._fold_key(str(key))
             if cls._is_ring_like_key(fk):
                 continue
-            if not any(
-                x in fk
-                for x in (
-                    "gorusme",
-                    "talk",
-                    "billsec",
-                    "bill",
-                    "answer",
-                    "connected",
-                    "conversation",
-                )
-            ):
+            if not any(x in fk for x in talk_hint):
                 continue
-            sec = cls._parse_duration_seconds(val)
+            # answeredAt gibi timestamp'i süre sanma
+            if any(x in fk for x in ("at", "date", "time", "stamp")) and not any(
+                x in fk for x in ("duration", "sec", "sure", "billsec", "talk")
+            ):
+                if not cls._looks_like_duration_value(val):
+                    continue
+            sec = cls._parse_duration_seconds(raw=val)
             if sec > 0:
                 return sec
 
-        ring = 0
-        for raw in cls._pick_all_present(row, _RING_DURATION_KEYS):
-            ring = max(ring, cls._parse_duration_seconds(raw))
-        # Heuristik ring
+        ring = cls._max_duration_for_keys(row, _RING_DURATION_KEYS, ring_only=True)
+        total = cls._max_duration_for_keys(row, _TOTAL_DURATION_KEYS, ring_only=False)
+
+        # Heuristik duration/sure
         for key, val in row.items():
             if val in (None, ""):
                 continue
             fk = cls._fold_key(str(key))
             if cls._is_ring_like_key(fk):
                 ring = max(ring, cls._parse_duration_seconds(val))
-
-        total = 0
-        for raw in cls._pick_all_present(row, _TOTAL_DURATION_KEYS):
-            total = max(total, cls._parse_duration_seconds(raw))
-        # Heuristik: duration / sure (ring değil)
-        for key, val in row.items():
-            if val in (None, ""):
                 continue
-            fk = cls._fold_key(str(key))
-            if cls._is_ring_like_key(fk):
-                continue
-            if "duration" in fk or "sure" in fk or fk.endswith("sec"):
+            if "duration" in fk or "sure" in fk or fk.endswith("sec") or fk.endswith("secs"):
                 if any(x in fk for x in ("wait", "hold", "queue")):
                     continue
                 total = max(total, cls._parse_duration_seconds(val))
 
-        # 3) FreePBX tarzı: duration=toplam, görüşme ≈ total - ring
+        # 3) total - ring
         if total > 0 and ring > 0:
             if total > ring:
                 return total - ring
-            # total == ring → cevaplanmamış / görüşme yok
             return 0
         if total > 0:
             return total
 
+        # 4) Timestamp farkı: ended - answered / hangup - answer
+        from_ts = cls._talk_from_timestamps(row)
+        if from_ts > 0:
+            return from_ts
+
+        # 5) Tüm satırda 00:MM:SS / MM:SS formatlı süre değerlerini tara
+        #    (saat 21:56:59 gibi saat değerlerini ele — saat kısmı >= 3 ise clock say)
+        scanned = cls._scan_duration_values(row)
+        if scanned > 0:
+            return scanned
+
         return 0
+
+    @classmethod
+    def _max_duration_for_keys(
+        cls,
+        row: dict[str, Any],
+        keys: tuple[str, ...],
+        *,
+        ring_only: bool,
+    ) -> int:
+        best = 0
+        for raw in cls._pick_all_present(row, keys):
+            best = max(best, cls._parse_duration_seconds(raw))
+        for key, val in row.items():
+            if val in (None, ""):
+                continue
+            fk = cls._fold_key(str(key))
+            if ring_only:
+                if cls._is_ring_like_key(fk):
+                    best = max(best, cls._parse_duration_seconds(val))
+            else:
+                if cls._is_ring_like_key(fk):
+                    continue
+        return best
+
+    @classmethod
+    def _talk_from_timestamps(cls, row: dict[str, Any]) -> int:
+        """answeredAt/endedAt farkından görüşme süresi."""
+        answer_keys = (
+            "answeredAt",
+            "answered_at",
+            "answerTime",
+            "answer_time",
+            "bridgeAt",
+            "bridge_at",
+            "connectTime",
+            "connect_time",
+        )
+        end_keys = (
+            "endedAt",
+            "ended_at",
+            "endTime",
+            "end_time",
+            "hangupAt",
+            "hangup_at",
+            "finishedAt",
+            "finished_at",
+            "completedAt",
+            "completed_at",
+        )
+        a_raw = cls._pick(row, answer_keys)
+        e_raw = cls._pick(row, end_keys)
+        if a_raw is None or e_raw is None:
+            return 0
+        a = cls._try_parse_single_datetime(a_raw)
+        e = cls._try_parse_single_datetime(e_raw)
+        if a is None or e is None:
+            return 0
+        delta = int((e[0] - a[0]).total_seconds())
+        return delta if delta > 0 else 0
+
+    @classmethod
+    def _scan_duration_values(cls, row: dict[str, Any]) -> int:
+        """
+        Anahtar adı bilinmese bile süre formatındaki değerleri topla.
+        Ring anahtarlarını ve duvar saati (21:56:59) değerlerini ele.
+        """
+        talk_like = 0
+        ring_like = 0
+        neutral = 0
+        for key, val in row.items():
+            if val in (None, ""):
+                continue
+            fk = cls._fold_key(str(key))
+            # net telefon / id / isim alanları
+            if any(
+                x in fk
+                for x in (
+                    "phone",
+                    "telefon",
+                    "caller",
+                    "callee",
+                    "agent",
+                    "dahili",
+                    "name",
+                    "queue",
+                    "hat",
+                    "trunk",
+                    "unique",
+                    "id",
+                )
+            ):
+                continue
+            if not cls._looks_like_duration_value(val):
+                continue
+            sec = cls._parse_duration_seconds(val)
+            if sec <= 0:
+                continue
+            if cls._is_ring_like_key(fk):
+                ring_like = max(ring_like, sec)
+            elif any(
+                x in fk
+                for x in (
+                    "gorusme",
+                    "talk",
+                    "bill",
+                    "answer",
+                    "bridge",
+                    "connected",
+                    "conversation",
+                    "duration",
+                    "sure",
+                )
+            ):
+                talk_like = max(talk_like, sec)
+            else:
+                # Anahtar belirsiz ama değer 00:01:26 gibi — aday
+                neutral = max(neutral, sec)
+
+        if talk_like > 0:
+            return talk_like
+        if neutral > 0 and ring_like > 0 and neutral > ring_like:
+            return neutral - ring_like if neutral != ring_like else 0
+        if neutral > 0 and ring_like == 0:
+            # Tek süre değeri; saat değilse (looks_like_duration) görüşme kabul
+            return neutral
+        return 0
+
+    @classmethod
+    def _looks_like_duration_value(cls, raw: Any) -> bool:
+        """00:01:26 / 1:26 / 86 — duvar saati 21:56:59 değil."""
+        if isinstance(raw, bool):
+            return False
+        if isinstance(raw, (int, float)):
+            n = float(raw)
+            # 0..6 saat makul görüşme; çok büyük sayılar ms olabilir
+            if 0 < n <= 6 * 3600:
+                return True
+            if 6 * 3600 < n <= 24 * 3600 * 1000:
+                return True  # ms adayı
+            return False
+        s = str(raw).strip().replace("：", ":").replace(".", ":")
+        if re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", s):
+            parts = [int(p) for p in s.split(":")]
+            if len(parts) == 3:
+                h, m, sec = parts
+                # Duvar saati genelde h>=1 ve toplam büyük; süre formatı panelde 00:01:26
+                if h == 0:
+                    return True
+                if h < 3 and m < 60:
+                    # 01:26:00 gibi uzun görüşme mümkün; 21:56:59 clock
+                    # Saat 3+ ise clock kabul (çağrı paneli saati)
+                    return h < 3
+                return False
+            if len(parts) == 2:
+                return True
+        if re.fullmatch(r"\d+", s):
+            return cls._looks_like_duration_value(int(s))
+        return False
 
     @staticmethod
     def _is_ring_like_key(folded_key: str) -> bool:
+        # "recording" içinde "ring" geçer — yanlış pozitif olmasın
+        if "record" in folded_key:
+            return False
         return any(
             x in folded_key
-            for x in ("ring", "caldir", "waiting", "hold", "queuewait")
+            for x in (
+                "ring",
+                "caldir",
+                "waiting",
+                "hold",
+                "queuewait",
+                "ringing",
+            )
         )
 
     @staticmethod
@@ -889,21 +1143,28 @@ class TonivaClient:
 
     @staticmethod
     def _parse_duration_seconds(raw: Any) -> int:
-        """Görüşme süresini saniyeye çevir. Ring/çaldırma alanları buraya gelmemeli."""
+        """Süreyi saniyeye çevir (görüşme veya ring)."""
         if raw is None or raw == "" or raw in ("-", "—", "–"):
             return 0
         if isinstance(raw, bool):
             return 0
         if isinstance(raw, (int, float)):
-            return max(0, int(raw))
+            n = float(raw)
+            if n <= 0:
+                return 0
+            # milisaniye (ör. 86000 → 86 sn)
+            if n > 6 * 3600:
+                return max(0, int(round(n / 1000.0)))
+            return int(n)
 
-        s = str(raw).strip()
+        s = str(raw).strip().replace("：", ":")
         if not s:
             return 0
 
-        # HH:MM:SS veya MM:SS
-        if re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", s):
-            parts = [int(p) for p in s.split(":")]
+        # HH:MM:SS veya MM:SS (nokta ayırıcı da)
+        s_norm = s.replace(".", ":") if re.fullmatch(r"\d{1,2}[.:]\d{2}([.:]\d{2})?", s) else s
+        if re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", s_norm):
+            parts = [int(p) for p in s_norm.split(":")]
             if len(parts) == 3:
                 h, m, sec = parts
                 return max(0, h * 3600 + m * 60 + sec)
@@ -911,14 +1172,24 @@ class TonivaClient:
                 m, sec = parts
                 return max(0, m * 60 + sec)
 
-        # "11 sn", "11s", "11 saniye"
+        # "11 sn", "11s", "11 saniye", "1 dk 26 sn"
+        dk = re.search(r"(\d+)\s*(?:dk|dakika|min)", s, re.I)
+        sn = re.search(r"(\d+)\s*(?:sn|sec|saniye|s)\b", s, re.I)
+        if dk or sn:
+            total = 0
+            if dk:
+                total += int(dk.group(1)) * 60
+            if sn:
+                total += int(sn.group(1))
+            if total > 0:
+                return total
+
         m = re.search(r"(\d+)", s)
         if m and re.search(r"sn|sec|saniye", s, re.I):
             return max(0, int(m.group(1)))
 
-        # düz sayı string
         if re.fullmatch(r"\d+", s):
-            return max(0, int(s))
+            return TonivaClient._parse_duration_seconds(int(s))
 
         return 0
 
