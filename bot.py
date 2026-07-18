@@ -59,22 +59,11 @@ def _lookback_range(settings: Settings) -> tuple:
 
 
 def _format_found(record) -> str:
-    if record.has_conversation:
-        # saniyeyi HH:MM:SS göster (API zaten string verdiyse parse edilmiş)
-        total = record.talk_seconds
-        h, rem = divmod(total, 3600)
-        m, s = divmod(rem, 60)
-        dur = f"{h:02d}:{m:02d}:{s:02d}"
-        gorusme = f"var ({dur})"
-    else:
-        gorusme = "yok"
-
     return (
-        f"👤 <b>Personel:</b> { _esc(record.agent_name) }\n"
-        f"📞 <b>Telefon:</b> { _esc(record.phone) }\n"
-        f"📅 <b>Son arama tarihi:</b> { _esc(record.call_date) }\n"
-        f"🕐 <b>Son arama saati:</b> { _esc(record.call_time) }\n"
-        f"⏱ <b>Görüşme süresi:</b> { _esc(gorusme) }"
+        f"👤 <b>Personel:</b> {_esc(record.agent_name)}\n"
+        f"📞 <b>Telefon:</b> {_esc(record.phone)}\n"
+        f"📅 <b>Son arama tarihi:</b> {_esc(record.call_date)}\n"
+        f"🕐 <b>Son arama saati:</b> {_esc(record.call_time)}"
     )
 
 
