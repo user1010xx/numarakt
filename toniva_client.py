@@ -92,9 +92,14 @@ _TIME_ONLY_KEYS = (
     "Saat",
     "callTime",
     "call_time",
+    "callStartTime",
+    "call_start_time",
+    "startClock",
     "timeOfDay",
     "time_of_day",
     "clock",
+    "hour",
+    "hours",
     # bare "time" en sonda — API bazen time=0 (süre) gönderiyor, saat değil
     "time",
 )
@@ -208,8 +213,21 @@ class TonivaClient:
             )
             return None
 
-        matches.sort(key=lambda r: r.sort_key, reverse=True)
-        return matches[0]
+        # Aynı numarayı birden fazla personel aramış olabilir → en son arama
+        # (tarih+saat sort_key en büyük olan; eşitlikte listedeki son kayıt)
+        latest = max(
+            enumerate(matches),
+            key=lambda pair: (pair[1].sort_key, pair[0]),
+        )[1]
+        logger.info(
+            "En son arama seçildi: phone=%s agent=%s at=%s %s (eşleşme=%s)",
+            latest.phone,
+            latest.agent_name,
+            latest.call_date,
+            latest.call_time,
+            len(matches),
+        )
+        return latest
 
     async def fetch_conversations(self, start: date, end: date) -> list[dict[str, Any]]:
         """
@@ -384,46 +402,41 @@ class TonivaClient:
         """
         Satırdan tarih+saat çıkar.
 
-        Hata kaynağı (canlı): API bazen `time: 0` (süre) döndürür; bu saat değildir.
-        Gerçek an genelde `calldate` / `startedAt` / birleşik ISO alandadır.
+        Canlı hata:
+        - `calldate` / `date` yalnızca gün bilgisini taşıyıp 00:00:00 dönüyordu;
+          paneldeki SAAT ayrı alanda kalıyordu.
+        - `time: 0` süre/flag; saat değildir.
         """
-        # 1) Tek alanda tam datetime
+        clock_raw = cls._find_clock_value(row)
+
+        best: tuple[datetime, str, str] | None = None
+
+        # 1) Bilinen datetime alanları
         for key in _DATETIME_KEYS:
             raw = cls._pick(row, (key,))
             if raw is None:
                 continue
             parsed = cls._try_parse_single_datetime(raw)
-            if parsed is not None:
-                return parsed
+            if parsed is None:
+                continue
+            merged = cls._apply_clock_if_needed(parsed, clock_raw)
+            best = cls._prefer_datetime(best, merged)
 
-        # 2) Ayrı tarih + saat alanları (saat doğrulanır)
+        # 2) Ayrı tarih + saat
         date_raw = cls._pick(row, _DATE_ONLY_KEYS)
-        time_raw = cls._pick_valid_clock(row, _TIME_ONLY_KEYS)
-        resolved = cls._resolve_datetime(date_raw, time_raw)
-        if resolved[0] != datetime.min:
-            return resolved
+        if date_raw is not None:
+            resolved = cls._resolve_datetime(date_raw, clock_raw)
+            if resolved[0] != datetime.min:
+                best = cls._prefer_datetime(best, resolved)
 
-        # 3) Heuristik: tüm alanlarda tarih/datetime benzeri değer tara
+        # 3) Heuristik tarama
         for key, val in row.items():
             if val in (None, "", 0, "0"):
                 continue
             fk = cls._fold_key(str(key))
-            # süre / ring alanlarını atla
-            if any(
-                x in fk
-                for x in (
-                    "duration",
-                    "sure",
-                    "suresi",
-                    "ring",
-                    "caldirma",
-                    "billsec",
-                    "talk",
-                    "gorusme",
-                )
-            ):
+            if cls._is_duration_like_key(fk):
                 continue
-            if any(
+            if not any(
                 x in fk
                 for x in (
                     "date",
@@ -437,41 +450,138 @@ class TonivaClient:
                     "stamp",
                 )
             ):
-                parsed = cls._try_parse_single_datetime(val)
-                if parsed is not None:
-                    return parsed
-                # yalnızca tarih string + ayrı saat
-                if isinstance(val, str) and _parse_date_only(val.strip()):
-                    t2 = cls._pick_valid_clock(row, _TIME_ONLY_KEYS)
-                    resolved = cls._resolve_datetime(val, t2)
-                    if resolved[0] != datetime.min:
-                        return resolved
+                continue
+            parsed = cls._try_parse_single_datetime(val)
+            if parsed is not None:
+                merged = cls._apply_clock_if_needed(parsed, clock_raw)
+                best = cls._prefer_datetime(best, merged)
+                continue
+            if isinstance(val, str) and _parse_date_only(val.strip()):
+                resolved = cls._resolve_datetime(val, clock_raw)
+                if resolved[0] != datetime.min:
+                    best = cls._prefer_datetime(best, resolved)
 
-        # 4) Son çare: bilinen ayrı alanlar ham
-        return cls._resolve_datetime(date_raw, time_raw)
+        if best is not None:
+            return best
+
+        return cls._resolve_datetime(date_raw, clock_raw)
+
+    @staticmethod
+    def _is_duration_like_key(folded_key: str) -> bool:
+        return any(
+            x in folded_key
+            for x in (
+                "duration",
+                "sure",
+                "suresi",
+                "ring",
+                "caldirma",
+                "billsec",
+                "talk",
+                "gorusme",
+                "wait",
+                "hold",
+            )
+        )
 
     @classmethod
-    def _pick_valid_clock(cls, row: dict[str, Any], keys: tuple[str, ...]) -> Any:
-        """Saat alanı: '0' / 0 / süre saniyesi gibi değerleri reddet."""
-        for k in keys:
+    def _find_clock_value(cls, row: dict[str, Any]) -> Any:
+        """Ayrı saat alanını bul (süre/flag olan 0 değerlerini ele)."""
+        for k in _TIME_ONLY_KEYS:
             raw = cls._pick(row, (k,))
             if raw is None:
                 continue
             if cls._is_plausible_clock(raw):
                 return raw
+
+        # Heuristik: anahtar adında saat/time, değerde HH:MM:SS
+        for key, val in row.items():
+            if val in (None, "", 0, "0"):
+                continue
+            fk = cls._fold_key(str(key))
+            if cls._is_duration_like_key(fk):
+                continue
+            if not any(x in fk for x in ("saat", "time", "clock", "hour")):
+                continue
+            # "timestamp", "datetime" birleşik alan — saat değil
+            if any(x in fk for x in ("stamp", "date", "duration", "starttime", "started")):
+                # startTime birleşik olabilir; değer yalnızca saat formatındaysa al
+                if not (
+                    isinstance(val, str)
+                    and re.fullmatch(r"\d{1,2}[:.]\d{2}([:.]\d{2})?", val.strip())
+                ):
+                    continue
+            if cls._is_plausible_clock(val):
+                return val
         return None
 
+    @classmethod
+    def _apply_clock_if_needed(
+        cls,
+        parsed: tuple[datetime, str, str],
+        clock_raw: Any,
+    ) -> tuple[datetime, str, str]:
+        """Datetime gece yarısı ise (veya saatsiz) ayrı clock ile birleştir."""
+        if clock_raw is None:
+            return parsed
+        dt, _d, _t = parsed
+        if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+            t_part = _parse_time_only(cls._clock_to_str(clock_raw))
+            if t_part is not None and not (
+                t_part.hour == 0 and t_part.minute == 0 and t_part.second == 0
+            ):
+                dt2 = datetime.combine(dt.date(), t_part)
+                return dt2, dt2.strftime("%d.%m.%Y"), dt2.strftime("%H:%M:%S")
+        return parsed
+
     @staticmethod
-    def _is_plausible_clock(raw: Any) -> bool:
+    def _prefer_datetime(
+        current: tuple[datetime, str, str] | None,
+        candidate: tuple[datetime, str, str],
+    ) -> tuple[datetime, str, str]:
+        """Gerçek saati olan adayı (00:00:00 olmayan) tercih et."""
+        if current is None:
+            return candidate
+        c_dt, _, _ = current
+        n_dt, _, _ = candidate
+        c_mid = c_dt.hour == 0 and c_dt.minute == 0 and c_dt.second == 0
+        n_mid = n_dt.hour == 0 and n_dt.minute == 0 and n_dt.second == 0
+        if c_mid and not n_mid:
+            return candidate
+        if not c_mid and n_mid:
+            return current
+        # ikisi de saati dolu veya ikisi de gece yarısı → daha geç olan
+        return candidate if n_dt >= c_dt else current
+
+    @classmethod
+    def _clock_to_str(cls, raw: Any) -> str:
+        if isinstance(raw, str):
+            return raw.strip().replace(".", ":")
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            n = int(raw)
+            # HHMMSS (ör. 214548 → 21:45:48)
+            if 0 < n <= 235959:
+                s = f"{n:06d}"
+                return f"{s[0:2]}:{s[2:4]}:{s[4:6]}"
+        return str(raw).strip()
+
+    @classmethod
+    def _is_plausible_clock(cls, raw: Any) -> bool:
         if raw is None or raw == "":
             return False
         if isinstance(raw, bool):
             return False
-        # Düz 0 veya küçük tam sayı = süre/flag, saat değil
         if isinstance(raw, (int, float)):
-            # epoch saat değil; büyük timestamp datetime tarafında ele alınır
+            n = int(raw)
+            # 0 = süre/flag; HHMMSS (en az 00:01:00 → 100) kabul
+            if n <= 0:
+                return False
+            if n <= 235959:
+                s = f"{n:06d}"
+                hh, mm, ss = int(s[0:2]), int(s[2:4]), int(s[4:6])
+                return hh <= 23 and mm <= 59 and ss <= 59
             return False
-        s = str(raw).strip()
+        s = str(raw).strip().replace(".", ":")
         if not s or s in ("0", "0.0", "-", "—", "–"):
             return False
         if re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", s):
@@ -512,14 +622,13 @@ class TonivaClient:
             return None
 
         # Yalnızca saat string'i tek başına datetime sayılmaz
-        if re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", s):
+        if re.fullmatch(r"\d{1,2}[:.]\d{2}([:.]\d{2})?", s):
             return None
 
         resolved = cls._resolve_datetime(s, None)
         if resolved[0] != datetime.min:
             return resolved
         return None
-
     @staticmethod
     def _fold_key(key: str) -> str:
         """Türkçe karakterleri sadeleştirerek karşılaştırma anahtarı üret."""
@@ -715,7 +824,7 @@ def _parse_date_only(s: str) -> date | None:
 def _parse_time_only(s: str) -> time | None:
     if not s:
         return None
-    s = s.strip()
+    s = s.strip().replace(".", ":")
     for fmt in ("%H:%M:%S", "%H:%M"):
         try:
             return datetime.strptime(s, fmt).time()
