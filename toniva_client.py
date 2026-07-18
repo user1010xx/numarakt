@@ -797,301 +797,151 @@ class TonivaClient:
     @classmethod
     def _extract_talk_seconds(cls, row: dict[str, Any]) -> int:
         """
-        Görüşme süresi (sn) = panel GÖRÜŞME SÜRESİ.
+        Panel GÖRÜŞME SÜRESİ (sn).
 
-        Canlı hata (00:09:51 yerine 00:01:26 olmalı):
-        - total−ring veya max(tüm süreler) şişirilmiş değer seçiyordu
-          (591 sn = muhtemelen arama başlangıcı→bitiş; gerçek talk 86 sn).
-        - Kör taramada max() almak total'i talk sanıyordu.
+        Canlı hatalar:
+        - 00:09:51 → total/max şişirmesi
+        - 00:00:01 → satırdaki rastgele int(1) süre sanılıp min() ile seçildi
 
-        Kural: açık talk alanı > kısa 00:MM:SS adayları (min) > dikkatli total−ring.
+        Kural (sıkı):
+        1) Yalnızca SÜRE anahtarı olan alanlar (talk/billsec/gorusme/…)
+        2) Bilinmeyen alandaki çıplak int ASLA süre değildir
+        3) min(tüm adaylar) YASAK — talk alanlarından max
+        4) total−ring yalnızca named total + named ring
         """
-        ring = cls._collect_ring_seconds(row)
-        talk_explicit = cls._collect_explicit_talk_seconds(row)
-        if talk_explicit > 0:
-            return talk_explicit
+        talk = cls._seconds_from_named_fields(row, kind="talk")
+        if talk > 0:
+            return talk
 
-        # Açık total alanları (sadece bilinen key'ler)
-        total = 0
-        for raw in cls._pick_all_present(row, _TOTAL_DURATION_KEYS):
-            sec = cls._parse_duration_seconds(raw)
-            if 0 < sec <= 3600:
-                total = max(total, sec)
+        ring = cls._seconds_from_named_fields(row, kind="ring")
+        total = cls._seconds_from_named_fields(row, kind="total")
 
-        # 00:MM:SS adayları — kaynak ayrımı: talk-ish / total-ish / other
-        short_talkish, short_other = cls._collect_short_duration_groups(row, ring)
-        all_short = sorted(set(short_talkish + short_other + ([total] if total else [])))
-
-        # 1) Kısa talk-ish adaylar (gorusme/talk string değerleri key'siz tarama)
-        if short_talkish:
-            return min(short_talkish)
-
-        # 2) ring biliniyor + birden fazla diğer kısa süre: en küçük = görüşme
-        #    (86 talk vs 591 total → 86). Tek diğer değer total ise total−ring.
-        if ring > 0:
-            non_ring = sorted({s for s in all_short if abs(s - ring) > 1})
-            if len(non_ring) >= 2:
-                return min(non_ring)
-            if len(non_ring) == 1:
-                only = non_ring[0]
-                # only açık total ile aynıysa → total−ring
-                if total > 0 and abs(only - total) <= 1 and only > ring:
-                    derived = only - ring
-                    if derived <= 300 or derived <= ring * 20:
-                        return derived
-                # only talk kolonu (86) — total değil
-                if total == 0 or abs(only - total) > 1:
-                    return only
-
-        # 3) total−ring (şişman türevi atla)
         if total > 0 and ring > 0 and total > ring:
             derived = total - ring
-            if derived > 300 and derived > ring * 20:
+            # kuyruk+bekleme şişirmesi (591 sn vb.)
+            if derived > 300 and derived > max(ring, 1) * 20:
                 logger.info(
-                    "total-ring şüpheli atlandı: total=%s ring=%s derived=%s",
+                    "total-ring atlandı total=%s ring=%s derived=%s",
                     total,
                     ring,
                     derived,
                 )
             else:
                 return derived
-        if total > 0 and ring == 0 and total <= 300:
+
+        # duration tek başına bazen talk (billsec yok)
+        if total > 0 and ring == 0 and total <= 3600:
             return total
-
-        # 4) ring yok, kısa adaylar
-        if ring == 0 and all_short:
-            if len(all_short) == 1:
-                return all_short[0]
-            if len(all_short) == 2:
-                return max(all_short)
-            return all_short[len(all_short) // 2]
-
-        from_ts = cls._talk_from_timestamps(row)
-        if 0 < from_ts <= 300:
-            return from_ts
-        if from_ts > 300:
-            logger.info("timestamp talk şüpheli atlandı: %ss", from_ts)
 
         return 0
 
     @classmethod
-    def _collect_short_duration_groups(
-        cls,
-        row: dict[str, Any],
-        ring: int,
-    ) -> tuple[list[int], list[int]]:
-        """(talk-ish kısa süreler, diğer kısa süreler)."""
-        talkish: list[int] = []
-        other: list[int] = []
-        skip_key_parts = (
-            "phone",
-            "telefon",
-            "caller",
-            "callee",
-            "agent",
-            "dahili",
-            "name",
-            "queue",
-            "hat",
-            "trunk",
-            "unique",
-            "id",
-            "date",
-            "tarih",
-            "saat",
-            "stamp",
-        )
-        talk_parts = (
-            "gorusme",
-            "talk",
-            "billsec",
-            "billed",
-            "conversation",
-            "connected",
-            "bridge",
-            "speaking",
-        )
+    def _seconds_from_named_fields(cls, row: dict[str, Any], *, kind: str) -> int:
+        """
+        kind: talk | ring | total
+        Sadece anahtar adı süre anlamı taşıyorsa değer okunur.
+        """
+        best = 0
         for key, val in row.items():
-            if val in (None, ""):
+            if val in (None, "", "-", "—", "–"):
                 continue
             fk = cls._fold_key(str(key))
-            if any(x in fk for x in skip_key_parts):
-                if not any(x in fk for x in ("talk", "ring", "bill", "gorusme", "duration", "sure")):
+            if not cls._key_matches_duration_kind(fk, kind):
+                continue
+            # duvar saati alanları
+            if fk in ("time", "saat", "date", "tarih") or fk.endswith("clock"):
+                continue
+            if "timestamp" in fk or (fk.endswith("at") and "duration" not in fk and "sec" not in fk):
+                continue
+            sec = cls._parse_duration_seconds(val)
+            # talk/ring için 00:MM:SS veya makul sn; 21:56:59 gibi saatleri ele
+            if isinstance(val, str) and re.fullmatch(
+                r"\d{1,2}:\d{2}:\d{2}",
+                val.strip().replace(".", ":").replace("：", ":"),
+            ):
+                parts = [int(p) for p in val.strip().replace(".", ":").replace("：", ":").split(":")]
+                if parts[0] >= 3:  # duvar saati
                     continue
-            # düz "time" / "saat" duvar saati
-            if fk in ("time", "saat") or fk.endswith("clock"):
+            if sec <= 0 or sec > 6 * 3600:
                 continue
-            if cls._is_ring_like_key(fk):
-                continue
-            if not (
-                cls._is_panel_duration_string(val)
-                or (
-                    isinstance(val, (int, float))
-                    and not isinstance(val, bool)
-                    and 0 < float(val) <= 3600
+            best = max(best, sec)
+        return best
+
+    @classmethod
+    def _key_matches_duration_kind(cls, folded_key: str, kind: str) -> bool:
+        fk = folded_key
+        # recording ≠ ring
+        if "record" in fk and kind == "ring":
+            return False
+
+        if kind == "ring":
+            if any(x in fk for x in ("ring", "caldir", "ringing")):
+                return "record" not in fk
+            return False
+
+        if kind == "talk":
+            # Net görüşme alanları — "answer"/"active" yok (şişirme)
+            if any(
+                x in fk
+                for x in (
+                    "gorusme",
+                    "talkduration",
+                    "talk_duration",
+                    "talksec",
+                    "talkseconds",
+                    "talktime",
+                    "billsec",
+                    "billedseconds",
+                    "conversationduration",
+                    "connectedduration",
+                    "bridgeduration",
+                    "speakingduration",
+                    "speakingtime",
                 )
             ):
-                continue
-            sec = cls._parse_duration_seconds(val)
-            if sec <= 0 or sec >= 3 * 3600:
-                continue
-            if abs(sec - ring) <= 1 and ring > 0:
-                continue
-            if any(t in fk for t in talk_parts):
-                talkish.append(sec)
-            else:
-                other.append(sec)
-        return talkish, other
-
-    @classmethod
-    def _collect_ring_seconds(cls, row: dict[str, Any]) -> int:
-        best = 0
-        for raw in cls._pick_all_present(row, _RING_DURATION_KEYS):
-            best = max(best, cls._parse_duration_seconds(raw))
-        for key, val in row.items():
-            if val in (None, ""):
-                continue
-            fk = cls._fold_key(str(key))
-            if cls._is_ring_like_key(fk) and cls._looks_like_duration_value(val):
-                best = max(best, cls._parse_duration_seconds(val))
-        return best
-
-    @classmethod
-    def _collect_explicit_talk_seconds(cls, row: dict[str, Any]) -> int:
-        """Yalnızca net görüşme alanları (answer/active/service YOK — şişirme riski)."""
-        best = 0
-        for raw in cls._pick_all_present(row, _TALK_DURATION_KEYS):
-            sec = cls._parse_duration_seconds(raw)
-            if sec > 0:
-                best = max(best, sec)
-
-        strict_hints = (
-            "gorusme",
-            "talkduration",
-            "talk_duration",
-            "talksec",
-            "talktime",
-            "billsec",
-            "billed",
-            "conversationduration",
-            "connectedduration",
-            "bridgeduration",
-            "speaking",
-        )
-        for key, val in row.items():
-            if val in (None, ""):
-                continue
-            fk = cls._fold_key(str(key))
-            if cls._is_ring_like_key(fk):
-                continue
-            # timestamp alanlarını ele
-            if fk.endswith("at") or "timestamp" in fk or fk in ("time", "saat", "date", "tarih"):
-                continue
-            if not any(h in fk for h in strict_hints) and "gorusme" not in fk:
-                # talk + duration birlikte
-                if not ("talk" in fk and ("duration" in fk or "sec" in fk or "sure" in fk)):
-                    if not ("bill" in fk and "sec" in fk):
-                        continue
-            if not cls._looks_like_duration_value(val):
-                continue
-            sec = cls._parse_duration_seconds(val)
-            # talkTime yanlışlıkla duvar saati 21:56:59 olmasın
-            if sec >= 3 * 3600:
-                continue
-            if sec > 0:
-                best = max(best, sec)
-        return best
-
-    @classmethod
-    def _is_panel_duration_string(cls, raw: Any) -> bool:
-        """Panel GÖRÜŞME/ÇALDIRMA: 00:01:26 — duvar saati 21:56:59 değil."""
-        if not isinstance(raw, str):
-            return False
-        s = raw.strip().replace("：", ":").replace(".", ":")
-        if not re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", s):
-            return False
-        parts = [int(p) for p in s.split(":")]
-        if len(parts) == 3:
-            h, m, sec = parts
-            # Panel süreleri neredeyse hep 00:xx:xx
-            return h == 0 and m < 60 and sec < 60
-        if len(parts) == 2:
-            m, sec = parts
-            return m < 60 and sec < 60
-        return False
-
-    @classmethod
-    def _talk_from_timestamps(cls, row: dict[str, Any]) -> int:
-        """Yalnızca answered/bridge → ended (start→end kullanma)."""
-        answer_keys = (
-            "answeredAt",
-            "answered_at",
-            "bridgeAt",
-            "bridge_at",
-            "connectTime",
-            "connect_time",
-        )
-        end_keys = (
-            "endedAt",
-            "ended_at",
-            "hangupAt",
-            "hangup_at",
-            "finishedAt",
-            "finished_at",
-            "completedAt",
-            "completed_at",
-        )
-        # answerTime/endTime saat string'i olabilir — sadece ISO/datetime dene
-        a_raw = cls._pick(row, answer_keys)
-        e_raw = cls._pick(row, end_keys)
-        if a_raw is None or e_raw is None:
-            return 0
-        a = cls._try_parse_single_datetime(a_raw)
-        e = cls._try_parse_single_datetime(e_raw)
-        if a is None or e is None:
-            return 0
-        delta = int((e[0] - a[0]).total_seconds())
-        return delta if delta > 0 else 0
-
-    @classmethod
-    def _looks_like_duration_value(cls, raw: Any) -> bool:
-        """00:01:26 / 1:26 / 86 — duvar saati 21:56:59 değil."""
-        if isinstance(raw, bool):
-            return False
-        if isinstance(raw, (int, float)):
-            n = float(raw)
-            if 0 < n <= 6 * 3600:
                 return True
-            if 6 * 3600 < n <= 24 * 3600 * 1000:
-                return True  # ms adayı
+            # talk + (duration|sec|sure|time) ama ring değil
+            if "talk" in fk and any(x in fk for x in ("duration", "sec", "sure", "time")):
+                return not cls._key_matches_duration_kind(fk, "ring")
+            if "bill" in fk and "sec" in fk:
+                return True
+            if "gorusme" in fk:
+                return True
             return False
-        if cls._is_panel_duration_string(raw):
-            return True
-        s = str(raw).strip().replace("：", ":")
-        if re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", s.replace(".", ":")):
-            parts = [int(p) for p in s.replace(".", ":").split(":")]
-            if len(parts) == 3:
-                return parts[0] == 0  # sadece 00:MM:SS
-            return len(parts) == 2
-        if re.fullmatch(r"\d+", s):
-            return cls._looks_like_duration_value(int(s))
+
+        if kind == "total":
+            # yalnızca genel çağrı süresi — queue/hold/wait hariç
+            if any(x in fk for x in ("queue", "hold", "wait", "pause")):
+                return False
+            if fk in ("duration", "callduration", "totalduration", "totalsec", "length"):
+                return True
+            if fk.endswith("duration") and not any(
+                x in fk
+                for x in (
+                    "talk",
+                    "ring",
+                    "gorusme",
+                    "caldir",
+                    "bill",
+                    "conversation",
+                    "connected",
+                    "bridge",
+                    "speaking",
+                    "record",
+                )
+            ):
+                return True
+            return False
+
         return False
 
     @staticmethod
     def _is_ring_like_key(folded_key: str) -> bool:
-        # "recording" içinde "ring" geçer — yanlış pozitif olmasın
         if "record" in folded_key:
             return False
         return any(
             x in folded_key
-            for x in (
-                "ring",
-                "caldir",
-                "waiting",
-                "hold",
-                "queuewait",
-                "ringing",
-            )
+            for x in ("ring", "caldir", "ringing")
         )
 
     @staticmethod
