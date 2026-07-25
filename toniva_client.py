@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
@@ -15,15 +16,19 @@ from phone_utils import digits_only, normalize_tr_phone, phones_equal
 logger = logging.getLogger(__name__)
 
 # UI / API alan adı varyasyonları
+# Canlı şema (Toniva conversations): ExtensionName, Phone, CreateDate, CreateTime, …
 _AGENT_KEYS = (
+    "ExtensionName",
+    "extensionName",
+    "extension_name",
+    "CompletedExtensionName",
+    "completedExtensionName",
     "dahiliAdi",
     "dahili_adi",
     "DAHİLİ ADI",
     "Dahili Adı",
     "agentName",
     "agent_name",
-    "extensionName",
-    "extension_name",
     "userName",
     "user_name",
     "agent",
@@ -32,16 +37,19 @@ _AGENT_KEYS = (
     "personel_adi",
     "name",
     "dahili",
+    "cnam",
+    "CNAM",
 )
 # Dış numara adayları (öncelik: müşteri / harici hat — dahili DEĞİL)
 _PHONE_KEYS = (
+    "Phone",  # canlı Toniva conversations
+    "phone",
     "telefon",
     "TELEFON",
     "Telefon",
     "telefonNumarasi",
     "telefon_numarasi",
     "Telefon Numarası",
-    "phone",
     "phoneNumber",
     "phone_number",
     "customerPhone",
@@ -68,13 +76,14 @@ _PHONE_KEYS = (
 )
 # Dahili / extension — dış numara adayı olarak düşük öncelik
 _EXTENSION_PHONE_KEYS = (
+    "ExtensionNumber",
+    "extensionNumber",
+    "extension_number",
     "dahiliNumarasi",
     "dahili_numarasi",
     "DAHİLİ NUMARASI",
     "Dahili Numarası",
     "extension",
-    "extensionNumber",
-    "extension_number",
     "ext",
     "exten",
     "agentExtension",
@@ -82,6 +91,9 @@ _EXTENSION_PHONE_KEYS = (
 )
 # Tam tarih+saat veya yalnızca tarih taşıyabilen alanlar (öncelik sırası)
 _DATETIME_KEYS = (
+    "CreateDate",  # canlı Toniva — bazen yalnız gün; CreateTime ile birleşir
+    "createDate",
+    "create_date",
     "calldate",  # FreePBX / Asterisk CDR — en sık
     "callDate",
     "call_date",
@@ -105,6 +117,9 @@ _DATETIME_KEYS = (
     "ts",
 )
 _DATE_ONLY_KEYS = (
+    "CreateDate",
+    "createDate",
+    "create_date",
     "tarih",
     "TARİH",
     "Tarih",
@@ -114,11 +129,12 @@ _DATE_ONLY_KEYS = (
     "call_day",
 )
 _TIME_ONLY_KEYS = (
+    "CreateTime",  # canlı Toniva duvar saati
+    "createTime",
+    "create_time",
     "saat",
     "SAAT",
     "Saat",
-    "callTime",
-    "call_time",
     "callStartTime",
     "call_start_time",
     "startClock",
@@ -127,11 +143,17 @@ _TIME_ONLY_KEYS = (
     "clock",
     "hour",
     "hours",
+    # CallTime canlı şemada GÖRÜŞME SÜRESİ — saat değil; sonda ve clock check ile elenir
+    "callTime",
+    "call_time",
     # bare "time" en sonda — API bazen time=0 (süre) gönderiyor, saat değil
     "time",
 )
 # Görüşme (talk) — çaldırma/ring YOK. Önce spesifik, sonda genel.
 _TALK_DURATION_KEYS = (
+    "CallTime",  # canlı Toniva = görüşme süresi
+    "callTime",
+    "call_time",
     "gorusmeSuresi",
     "görüşmeSüresi",
     "gorusme_suresi",
@@ -192,6 +214,12 @@ _TOTAL_DURATION_KEYS = (
 )
 # Çaldırma — görüşmeden düşmek için
 _RING_DURATION_KEYS = (
+    "RingTime",
+    "ringTime",
+    "ring_time",
+    "WaitTime",
+    "waitTime",
+    "wait_time",
     "caldirmaSuresi",
     "çaldırmaSüresi",
     "caldirma_suresi",
@@ -202,8 +230,6 @@ _RING_DURATION_KEYS = (
     "ring_sec",
     "ringSeconds",
     "ring_seconds",
-    "ringTime",
-    "ring_time",
     "ringingDuration",
     "ringing_duration",
     "ringingTime",
@@ -416,25 +442,38 @@ class TonivaClient:
         """
         conversations raporunu çeker.
 
-        Her zaman pageSize ile sayfalar (5000 tavanını ve truncated bayrağına
-        bağımlılığı aşmak için). Büyük pencerelerde haftalık parçalar.
+        Canlı hata: API pageSize=1000 istense bile ~200 satır döndürüp
+        total_count=20880 veriyordu; kısa sayfada durmak 400/20880 satırda
+        kesiyordu → numara set dışında kalıp BULUNAMADI.
+
+        Strateji: total_count bitene kadar sayfala; büyük pencereleri
+        günlük parçala (rate limit + erken arama için).
         """
-        # 31 günden uzun aralıkları parçala (bazı raporlar max pencere kısıtlı)
-        chunks = self._date_chunks(start, end, max_days=14)
+        chunks = self._date_chunks(start, end, max_days=3)
         all_rows: list[dict[str, Any]] = []
         last_meta: dict[str, Any] = {}
         seen_ids: set[str] = set()
+        total_reported = 0
+        total_fetched = 0
 
         for c_start, c_end in chunks:
             rows, meta = await self._fetch_window_paginated(c_start, c_end)
             last_meta = meta
+            total_reported += int(meta.get("total_count") or 0)
+            total_fetched += int(meta.get("fetched_count") or len(rows))
             for r in rows:
-                # mükerrer satırları ele (id / uniqueid varsa)
                 rid = self._row_dedupe_key(r)
                 if rid in seen_ids:
                     continue
                 seen_ids.add(rid)
                 all_rows.append(r)
+
+        last_meta = {
+            **last_meta,
+            "total_count": total_reported or last_meta.get("total_count"),
+            "fetched_count": len(all_rows),
+            "windows": len(chunks),
+        }
 
         if all_rows and isinstance(all_rows[0], dict) and not self._logged_schema:
             self._logged_schema = True
@@ -443,7 +482,7 @@ class TonivaClient:
                 list(all_rows[0].keys())[:40],
                 {
                     k: last_meta.get(k)
-                    for k in ("total_count", "truncated", "page", "page_size")
+                    for k in ("total_count", "truncated", "page", "page_size", "fetched_count")
                 },
                 len(all_rows),
                 len(chunks),
@@ -468,9 +507,10 @@ class TonivaClient:
         if not isinstance(row, dict):
             return str(id(row))
         for k in (
-            "id",
+            "CallID",
             "callId",
             "call_id",
+            "id",
             "uniqueid",
             "uniqueId",
             "linkedid",
@@ -478,7 +518,6 @@ class TonivaClient:
         ):
             if row.get(k) not in (None, ""):
                 return f"{k}:{row.get(k)}"
-        # imza: tüm skaler değerlerin kısa özeti
         parts = []
         for k in sorted(row.keys()):
             v = row[k]
@@ -489,33 +528,52 @@ class TonivaClient:
                 break
         return "|".join(parts) if parts else str(id(row))
 
+    @staticmethod
+    def _meta_total_count(meta: dict[str, Any]) -> int | None:
+        for k in ("total_count", "totalCount", "total", "TotalCount", "count"):
+            v = meta.get(k)
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)) and int(v) >= 0:
+                return int(v)
+            if isinstance(v, str) and v.isdigit():
+                return int(v)
+        return None
+
     async def _fetch_window_paginated(
         self, start: date, end: date
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """Tek tarih penceresini pageSize ile tamamen çek."""
-        page_size = 1000
+        """
+        Tek tarih penceresini tamamen çek.
+
+        Kritik: API istenen pageSize'dan az satır döndürebilir (ör. 200).
+        total_count varsa kısa sayfada DURMA — total dolana kadar sayfala.
+        """
+        # OpenAPI max 5000; API fiilen ~200 de kesebilir
+        requested_page_size = 5000
         page = 1
         all_rows: list[dict[str, Any]] = []
         total: int | None = None
         last_meta: dict[str, Any] = {}
+        effective_page_size: int | None = None
 
         while True:
             data = await self._get_report(
                 {
                     "startDate": start.isoformat(),
                     "endDate": end.isoformat(),
-                    "pageSize": page_size,
+                    "pageSize": requested_page_size,
                     "page": page,
                 }
             )
             batch = self._extract_rows(data)
             meta = self._extract_meta(data)
             last_meta = meta
-            if total is None and isinstance(meta.get("total_count"), int):
-                total = int(meta["total_count"])
+            t = self._meta_total_count(meta)
+            if total is None and t is not None:
+                total = t
 
             if page == 1 and not batch:
-                # pageSize desteklenmiyor / farklı şema olabilir → pageSize'sız dene
                 data2 = await self._get_report(
                     {
                         "startDate": start.isoformat(),
@@ -526,65 +584,131 @@ class TonivaClient:
                 meta2 = self._extract_meta(data2)
                 if batch2:
                     logger.info(
-                        "pageSize'sız fallback kullanıldı: rows=%s meta=%s",
+                        "pageSize'sız fallback: rows=%s meta=%s",
                         len(batch2),
-                        {k: meta2.get(k) for k in ("total_count", "truncated")},
+                        {k: meta2.get(k) for k in ("total_count", "truncated", "totalCount")},
                     )
-                    return batch2, meta2
-                # boş ama ham gövde ipucu
-                if isinstance(data, dict) and not last_meta.get("_raw_keys"):
-                    last_meta = {
-                        **meta,
-                        "_raw_keys": list(data.keys())[:20],
+                    return batch2, {
+                        **meta2,
+                        "fetched_count": len(batch2),
+                        "window": f"{start.isoformat()}..{end.isoformat()}",
                     }
-                return [], last_meta
+                if isinstance(data, dict):
+                    last_meta = {**meta, "_raw_keys": list(data.keys())[:20]}
+                return [], {
+                    **last_meta,
+                    "fetched_count": 0,
+                    "window": f"{start.isoformat()}..{end.isoformat()}",
+                }
+
+            if not batch:
+                # sonraki sayfa boş → bitti
+                break
 
             all_rows.extend(batch)
+            if effective_page_size is None:
+                effective_page_size = len(batch)
+
+            logger.info(
+                "conversations sayfa=%s batch=%s toplam_çekilen=%s total_count=%s (%s→%s)",
+                page,
+                len(batch),
+                len(all_rows),
+                total,
+                start,
+                end,
+            )
 
             if total is not None and len(all_rows) >= total:
                 break
-            if len(batch) < page_size:
+
+            # total biliniyor ve henüz dolmadı → kısa sayfa olsa bile devam
+            if total is not None and len(all_rows) < total:
+                page += 1
+                if page > 500:
+                    logger.warning(
+                        "sayfalama 500 sayfada kesildi (%s→%s) çekilen=%s total=%s",
+                        start,
+                        end,
+                        len(all_rows),
+                        total,
+                    )
+                    break
+                continue
+
+            # total yok: fiili sayfa boyutundan kısa → son sayfa
+            page_cap = effective_page_size or requested_page_size
+            if len(batch) < page_cap:
                 break
+
             page += 1
-            if page > 100:
+            if page > 500:
                 logger.warning(
-                    "conversations sayfalama 100 sayfada kesildi (%s→%s)",
+                    "sayfalama 500 sayfada kesildi (%s→%s) çekilen=%s",
                     start,
                     end,
+                    len(all_rows),
                 )
                 break
 
         last_meta = {
             **last_meta,
+            "total_count": total if total is not None else last_meta.get("total_count"),
             "fetched_count": len(all_rows),
+            "pages": page,
+            "effective_page_size": effective_page_size,
             "window": f"{start.isoformat()}..{end.isoformat()}",
         }
+        if total is not None and len(all_rows) < total:
+            logger.warning(
+                "eksik çekim: fetched=%s < total_count=%s (%s→%s)",
+                len(all_rows),
+                total,
+                start,
+                end,
+            )
         return all_rows, last_meta
 
     async def _get_report(self, params: dict[str, Any]) -> Any:
         url = "/reports/conversations"
-        try:
-            resp = await self._client.get(url, params=params)
-        except httpx.HTTPError as exc:
-            logger.exception("Toniva istek hatası: %s", exc)
-            raise RuntimeError(f"Toniva API bağlantı hatası: {exc}") from exc
+        last_err: Exception | None = None
+        for attempt in range(6):
+            try:
+                resp = await self._client.get(url, params=params)
+            except httpx.HTTPError as exc:
+                logger.exception("Toniva istek hatası: %s", exc)
+                raise RuntimeError(f"Toniva API bağlantı hatası: {exc}") from exc
 
-        if resp.status_code == 429:
-            retry = resp.headers.get("Retry-After", "?")
-            raise RuntimeError(
-                f"Toniva rate limit (CRM-2094). Retry-After: {retry} sn"
-            )
+            if resp.status_code == 429:
+                raw_retry = resp.headers.get("Retry-After", "2")
+                try:
+                    wait_s = max(1, int(float(raw_retry)))
+                except ValueError:
+                    wait_s = 2
+                wait_s = min(wait_s, 30)
+                logger.warning(
+                    "Toniva 429 rate limit, %ss bekleniyor (deneme %s/6)",
+                    wait_s,
+                    attempt + 1,
+                )
+                await asyncio.sleep(wait_s)
+                last_err = RuntimeError(
+                    f"Toniva rate limit (CRM-2094). Retry-After: {raw_retry} sn"
+                )
+                continue
 
-        if resp.status_code >= 400:
-            detail = resp.text[:400]
-            raise RuntimeError(
-                f"Toniva API hata {resp.status_code}: {detail}"
-            )
+            if resp.status_code >= 400:
+                detail = resp.text[:400]
+                raise RuntimeError(
+                    f"Toniva API hata {resp.status_code}: {detail}"
+                )
 
-        try:
-            return resp.json()
-        except ValueError as exc:
-            raise RuntimeError("Toniva API geçersiz JSON döndü") from exc
+            try:
+                return resp.json()
+            except ValueError as exc:
+                raise RuntimeError("Toniva API geçersiz JSON döndü") from exc
+
+        raise last_err or RuntimeError("Toniva rate limit aşıldı")
 
     @staticmethod
     def _extract_rows(data: Any) -> list[dict[str, Any]]:
@@ -1019,8 +1143,12 @@ class TonivaClient:
 
     @staticmethod
     def _is_duration_like_key(folded_key: str) -> bool:
+        fk = folded_key
+        # Canlı şema: CallTime/RingTime/WaitTime süre; CreateTime duvar saati
+        if fk in ("calltime", "ringtime", "waittime"):
+            return True
         return any(
-            x in folded_key
+            x in fk
             for x in (
                 "duration",
                 "sure",
@@ -1039,6 +1167,8 @@ class TonivaClient:
     def _find_clock_value(cls, row: dict[str, Any]) -> Any:
         """Ayrı saat alanını bul (süre/flag olan 0 değerlerini ele)."""
         for k in _TIME_ONLY_KEYS:
+            if cls._is_duration_like_key(cls._fold_key(k)):
+                continue  # CallTime = görüşme süresi, saat değil
             raw = cls._pick(row, (k,))
             if raw is None:
                 continue
@@ -1319,6 +1449,9 @@ class TonivaClient:
             return False
 
         if kind == "talk":
+            # Canlı Toniva: CallTime = görüşme süresi (CreateTime ≠)
+            if fk in ("calltime", "call_time"):
+                return True
             # Net görüşme alanları — "answer"/"active" yok (şişirme)
             if any(
                 x in fk
