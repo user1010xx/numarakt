@@ -95,57 +95,8 @@ async def test_find_uses_cache_first(cache: CallCache):
 
 
 @pytest.mark.asyncio
-async def test_phone_filter_path(cache: CallCache):
-    client = TonivaClient(api_key="x", cache=cache)
-    calls = []
-
-    async def fake_get(params):
-        calls.append(dict(params))
-        # phone paramı varsa filtrele
-        if params.get("phone") == "905515395755":
-            return {
-                "meta": {"total_count": 1},
-                "rows": [
-                    {
-                        "Phone": "905515395755",
-                        "ExtensionName": "dilara",
-                        "CreateDate": "2026-07-20",
-                        "CreateTime": "11:00:00",
-                        "CallTime": "00:00:30",
-                        "CallID": "1",
-                    }
-                ],
-            }
-        # filtresiz büyük set
-        return {
-            "meta": {"total_count": 50000},
-            "rows": [
-                {
-                    "Phone": "905452890657",
-                    "ExtensionName": "x",
-                    "CreateDate": "2026-07-25",
-                    "CreateTime": "10:00:00",
-                    "CallID": "2",
-                }
-            ],
-        }
-
-    client._get_report = fake_get  # type: ignore
-
-    result = await client.find_latest_call(
-        "905515395755", date(2026, 6, 25), date(2026, 7, 25)
-    )
-    assert result.record is not None
-    assert result.source == "phone_filter"
-    assert result.record.agent_name == "dilara"
-    assert any("phone" in c for c in calls)
-
-
-@pytest.mark.asyncio
 async def test_day_scan_early_exit():
     client = TonivaClient(api_key="x")
-    # filtre yok — doğrudan gün taraması
-    client._phone_filter_param = False
     scan_pages: dict[str, int] = {}
 
     async def fake_get(params):
