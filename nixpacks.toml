@@ -1,5 +1,3 @@
+# Sadece log buffer — özel nixPkgs YOK (runtime'ı bozmasın)
 [variables]
 PYTHONUNBUFFERED = "1"
-
-[phases.setup]
-nixPkgs = ["python312", "tzdata"]
