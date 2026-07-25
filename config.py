@@ -27,6 +27,13 @@ def _parse_chat_ids(raw: str | None) -> frozenset[int]:
     return frozenset(ids)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass(frozen=True)
 class Settings:
     telegram_bot_token: str
@@ -34,7 +41,9 @@ class Settings:
     toniva_base_url: str
     allowed_chat_ids: frozenset[int]
     timezone: str
-    lookback_days: int = 30
+    lookback_days: int
+    cache_path: str
+    cache_sync_on_start: bool
 
 
 def load_settings() -> Settings:
@@ -49,10 +58,19 @@ def load_settings() -> Settings:
     if not api_key:
         raise SystemExit("TONIVA_API_KEY tanımlı değil.")
 
+    lookback_raw = (os.getenv("LOOKBACK_DAYS") or "30").strip()
+    try:
+        lookback_days = max(1, min(90, int(lookback_raw)))
+    except ValueError as exc:
+        raise SystemExit(f"LOOKBACK_DAYS geçersiz: {lookback_raw!r}") from exc
+
     return Settings(
         telegram_bot_token=token,
         toniva_api_key=api_key,
         toniva_base_url=base_url,
         allowed_chat_ids=_parse_chat_ids(os.getenv("ALLOWED_CHAT_IDS")),
         timezone=(os.getenv("TZ") or "Europe/Istanbul").strip(),
+        lookback_days=lookback_days,
+        cache_path=(os.getenv("CACHE_PATH") or "data/calls.db").strip(),
+        cache_sync_on_start=_env_bool("CACHE_SYNC_ON_START", True),
     )

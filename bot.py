@@ -11,6 +11,7 @@ Kullanım (yalnızca grup/supergroup):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import datetime, timedelta
@@ -24,6 +25,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
+from call_cache import CallCache
 from config import Settings, load_settings
 from phone_utils import normalize_tr_phone
 from toniva_client import TonivaClient
@@ -34,7 +36,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("kt-bot")
 
-# /kt 9055... veya /kt@BotName 0555...
 _KT_RE = re.compile(
     r"^/kt(?:@\w+)?\s+(.+)$",
     re.IGNORECASE | re.DOTALL,
@@ -58,12 +59,14 @@ def _lookback_range(settings: Settings) -> tuple:
     return start, today
 
 
-def _format_found(record) -> str:
+def _format_found(record, *, source: str = "") -> str:
+    src = f"\n🗄 <i>kaynak: {_esc(source)}</i>" if source else ""
     return (
         f"👤 <b>Personel:</b> {_esc(record.agent_name)}\n"
         f"📞 <b>Telefon:</b> {_esc(record.phone)}\n"
         f"📅 <b>Son arama tarihi:</b> {_esc(record.call_date)}\n"
         f"🕐 <b>Son arama saati:</b> {_esc(record.call_time)}"
+        f"{src}"
     )
 
 
@@ -85,7 +88,6 @@ async def kt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     chat = update.effective_chat
 
-    # Sadece grup
     if not _is_group(chat.type):
         logger.info("Özel sohbet yok sayıldı chat_id=%s", chat.id)
         return
@@ -125,19 +127,10 @@ async def kt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         parse_mode=ParseMode.HTML,
     )
 
-    _last_progress_page = {"n": 0}
-
-    async def on_progress(page: int, rows_so_far: int, total_hint: int | None) -> None:
-        # Her sayfada değil; 1. ve her 3. sayfada güncelle (Telegram flood)
-        if page > 1 and page - _last_progress_page["n"] < 3:
-            return
-        _last_progress_page["n"] = page
-        total_txt = f"/{total_hint}" if total_hint else ""
+    async def on_progress(msg: str) -> None:
         try:
             await wait.edit_text(
-                f"🔍 Aranıyor… sayfa <b>{page}</b> "
-                f"(satır {rows_so_far}{total_txt})\n"
-                f"<code>{_esc(normalized)}</code>",
+                f"🔍 {_esc(msg)}\n<code>{_esc(normalized)}</code>",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
@@ -154,40 +147,33 @@ async def kt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if result.record is None:
         meta = result.meta_summary or {}
-        diag_lines = [
+        diag = [
             "❌ <b>BULUNAMADI</b>",
             f"Numara: <code>{_esc(normalized)}</code>",
             f"Aralık: {start.isoformat()} → {end.isoformat()}",
-            (
-                f"API: satır={result.row_count} parse={result.parsed_count} "
-                f"eşleşme={result.match_count}"
-            ),
+            f"Kaynak: {_esc(result.source or '—')}",
+            f"Satır: {result.row_count} eşleşme={result.match_count}",
         ]
         if result.note:
-            diag_lines.append(f"Not: {_esc(result.note)}")
-        if meta.get("total_count") is not None or meta.get("fetched_count") is not None:
-            diag_lines.append(
-                "Meta: "
-                f"total={_esc(str(meta.get('total_count', '—')))} "
-                f"fetched={_esc(str(meta.get('fetched_count', '—')))} "
-                f"trunc={_esc(str(meta.get('truncated', '—')))}"
+            diag.append(f"Not: {_esc(result.note)}")
+        if meta.get("filter"):
+            diag.append(f"Filtre: {_esc(str(meta.get('filter')))}")
+        if meta.get("pagination_broken"):
+            diag.append("⚠ API sayfalama tutarsız (duplicate page)")
+        cache: CallCache | None = context.application.bot_data.get("cache")
+        if cache:
+            st = cache.stats()
+            diag.append(
+                f"Önbellek: {st.row_count} kayıt"
+                + (f" ({st.min_date}→{st.max_date})" if st.min_date else "")
             )
-        if meta.get("_raw_keys"):
-            diag_lines.append(
-                f"JSON anahtarları: <code>{_esc(', '.join(map(str, meta['_raw_keys'][:15])))}</code>"
-            )
-        if result.sample_keys:
-            diag_lines.append(
-                f"Alanlar: <code>{_esc(', '.join(result.sample_keys[:12]))}</code>"
-            )
-        if result.sample_phone_values:
-            diag_lines.append(
-                f"Örnek tel: <code>{_esc(' | '.join(result.sample_phone_values[:6]))}</code>"
-            )
-        await wait.edit_text("\n".join(diag_lines), parse_mode=ParseMode.HTML)
+        await wait.edit_text("\n".join(diag), parse_mode=ParseMode.HTML)
         return
 
-    await wait.edit_text(_format_found(result.record), parse_mode=ParseMode.HTML)
+    await wait.edit_text(
+        _format_found(result.record, source=result.source or result.note),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -198,8 +184,34 @@ async def post_init(app: Application) -> None:
     me = await app.bot.get_me()
     logger.info("Bot hazır: @%s (id=%s)", me.username, me.id)
 
+    settings: Settings = app.bot_data["settings"]
+    client: TonivaClient = app.bot_data["toniva"]
+    cache: CallCache | None = app.bot_data.get("cache")
+
+    if cache is None or not settings.cache_sync_on_start:
+        return
+
+    async def _bg_sync() -> None:
+        try:
+            start, end = _lookback_range(settings)
+            logger.info("Arka plan cache sync başlıyor %s → %s", start, end)
+            result = await client.sync_to_cache(start, end)
+            logger.info("Arka plan cache sync bitti: %s", result)
+        except Exception:
+            logger.exception("Arka plan cache sync hata")
+
+    app.bot_data["sync_task"] = asyncio.create_task(_bg_sync())
+
 
 async def post_shutdown(app: Application) -> None:
+    task = app.bot_data.get("sync_task")
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
     client: TonivaClient | None = app.bot_data.get("toniva")
     if client:
         await client.aclose()
@@ -208,9 +220,11 @@ async def post_shutdown(app: Application) -> None:
 
 def main() -> None:
     settings = load_settings()
+    cache = CallCache(settings.cache_path)
     client = TonivaClient(
         api_key=settings.toniva_api_key,
         base_url=settings.toniva_base_url,
+        cache=cache,
     )
 
     app = (
@@ -222,17 +236,18 @@ def main() -> None:
     )
     app.bot_data["settings"] = settings
     app.bot_data["toniva"] = client
+    app.bot_data["cache"] = cache
 
-    # Özel sohbette sessiz: kt_command içinde grup kontrolü var
     app.add_handler(CommandHandler("kt", kt_command))
     app.add_error_handler(on_error)
 
+    st = cache.stats()
     logger.info(
-        "Başlatılıyor… lookback=%s gün, allowed_chats=%s",
+        "Başlatılıyor… lookback=%s gün, cache_rows=%s, allowed_chats=%s",
         settings.lookback_days,
+        st.row_count,
         sorted(settings.allowed_chat_ids) if settings.allowed_chat_ids else "tüm gruplar",
     )
-    # Railway worker: uzun süreli polling
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,

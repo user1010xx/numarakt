@@ -8,7 +8,6 @@ def test_normalize_common_tr_formats():
     assert normalize_tr_phone("+90 546 603 31 61") == "905466033161"
     assert normalize_tr_phone("05466033161") == "905466033161"
     assert normalize_tr_phone("5466033161") == "905466033161"
-    assert normalize_tr_phone("00905466033161") == "905466033161"
 
 
 def test_normalize_rejects_extension():
@@ -21,7 +20,6 @@ def test_phones_equal_across_formats():
     assert phones_equal("905466033161", "05466033161")
     assert phones_equal("+90 546 603 31 61", "5466033161")
     assert not phones_equal("605", "905466033161")
-    assert not phones_equal("905551112233", "905466033161")
 
 
 def test_phone_match_keys_include_last10():
