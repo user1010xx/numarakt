@@ -127,22 +127,48 @@ async def kt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
     try:
-        record = await client.find_latest_call(normalized, start, end)
+        result = await client.find_latest_call(normalized, start, end)
     except Exception as exc:
         logger.exception("Sorgulama hatası")
         await wait.edit_text(f"⚠️ Sorgulanamadı: {_esc(str(exc))}")
         return
 
-    if record is None:
-        await wait.edit_text(
-            f"❌ <b>BULUNAMADI</b>\n"
-            f"Numara: <code>{_esc(normalized)}</code>\n"
+    if result.record is None:
+        meta = result.meta_summary or {}
+        diag_lines = [
+            "❌ <b>BULUNAMADI</b>",
+            f"Numara: <code>{_esc(normalized)}</code>",
             f"Aralık: {start.isoformat()} → {end.isoformat()}",
-            parse_mode=ParseMode.HTML,
-        )
+            (
+                f"API: satır={result.row_count} parse={result.parsed_count} "
+                f"eşleşme={result.match_count}"
+            ),
+        ]
+        if result.note:
+            diag_lines.append(f"Not: {_esc(result.note)}")
+        if meta.get("total_count") is not None or meta.get("fetched_count") is not None:
+            diag_lines.append(
+                "Meta: "
+                f"total={_esc(str(meta.get('total_count', '—')))} "
+                f"fetched={_esc(str(meta.get('fetched_count', '—')))} "
+                f"trunc={_esc(str(meta.get('truncated', '—')))}"
+            )
+        if meta.get("_raw_keys"):
+            diag_lines.append(
+                f"JSON anahtarları: <code>{_esc(', '.join(map(str, meta['_raw_keys'][:15])))}</code>"
+            )
+        if result.sample_keys:
+            diag_lines.append(
+                f"Alanlar: <code>{_esc(', '.join(result.sample_keys[:12]))}</code>"
+            )
+        if result.sample_phone_values:
+            diag_lines.append(
+                f"Örnek tel: <code>{_esc(' | '.join(result.sample_phone_values[:6]))}</code>"
+            )
+        await wait.edit_text("\n".join(diag_lines), parse_mode=ParseMode.HTML)
         return
 
-    await wait.edit_text(_format_found(record), parse_mode=ParseMode.HTML)
+    await wait.edit_text(_format_found(result.record), parse_mode=ParseMode.HTML)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

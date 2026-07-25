@@ -148,21 +148,25 @@ def test_find_latest_among_matches(client: TonivaClient, monkeypatch: pytest.Mon
             },
         ]
 
-    monkeypatch.setattr(client, "fetch_conversations", fake_fetch)
+    async def fake_fetch_wrap(start: date, end: date):
+        return await fake_fetch(start, end), {}
+
+    monkeypatch.setattr(client, "fetch_conversations", fake_fetch_wrap)
 
     import asyncio
 
-    rec = asyncio.run(
+    result = asyncio.run(
         client.find_latest_call(
             "905466033161",
             date(2026, 6, 25),
             date(2026, 7, 25),
         )
     )
-    assert rec is not None
-    assert rec.agent_name == "asu"
-    assert rec.call_date == "21.07.2026"
-    assert rec.call_time == "13:23:22"
+    assert result.record is not None
+    assert result.record.agent_name == "asu"
+    assert result.record.call_date == "21.07.2026"
+    assert result.record.call_time == "13:23:22"
+    assert result.match_count >= 1
 
 
 def test_find_latest_miss_when_only_other_numbers(
@@ -178,18 +182,22 @@ def test_find_latest_miss_when_only_other_numbers(
             }
         ]
 
-    monkeypatch.setattr(client, "fetch_conversations", fake_fetch)
+    async def fake_fetch_wrap(start: date, end: date):
+        return await fake_fetch(start, end), {}
+
+    monkeypatch.setattr(client, "fetch_conversations", fake_fetch_wrap)
 
     import asyncio
 
-    rec = asyncio.run(
+    result = asyncio.run(
         client.find_latest_call(
             "905466033161",
             date(2026, 6, 25),
             date(2026, 7, 25),
         )
     )
-    assert rec is None
+    assert result.record is None
+    assert result.row_count == 1
 
 
 def test_regression_user_case_extension_shadowing(
@@ -215,18 +223,76 @@ def test_regression_user_case_extension_shadowing(
             }
         ]
 
-    monkeypatch.setattr(client, "fetch_conversations", fake_fetch)
+    async def fake_fetch_wrap(start: date, end: date):
+        return await fake_fetch(start, end), {}
+
+    monkeypatch.setattr(client, "fetch_conversations", fake_fetch_wrap)
 
     import asyncio
 
-    rec = asyncio.run(
+    result = asyncio.run(
         client.find_latest_call(
             "905466033161",
             date(2026, 6, 25),
             date(2026, 7, 25),
         )
     )
-    assert rec is not None
-    assert rec.agent_name == "asu"
-    assert rec.phone == "905466033161"
-    assert rec.sort_key == datetime(2026, 7, 21, 13, 23, 22)
+    assert result.record is not None
+    assert result.record.agent_name == "asu"
+    assert result.record.phone == "905466033161"
+    assert result.record.sort_key == datetime(2026, 7, 21, 13, 23, 22)
+
+
+def test_match_phone_in_unknown_field(client: TonivaClient, monkeypatch: pytest.MonkeyPatch):
+    """Alan adı bilinmese bile değer taraması ile bulunur."""
+
+    async def fake_fetch(start: date, end: date):
+        return [
+            {
+                "weirdField": "905466033161",
+                "agentLabel": "asu",
+                "when": "2026-07-21 13:23:22",
+            }
+        ]
+
+    async def fake_fetch_wrap(start: date, end: date):
+        return await fake_fetch(start, end), {"total_count": 1}
+
+    monkeypatch.setattr(client, "fetch_conversations", fake_fetch_wrap)
+
+    import asyncio
+
+    result = asyncio.run(
+        client.find_latest_call(
+            "905466033161",
+            date(2026, 6, 25),
+            date(2026, 7, 25),
+        )
+    )
+    assert result.record is not None
+    assert result.record.phone == "905466033161"
+
+
+def test_deep_extract_rows_nested_payload():
+    data = {
+        "status": "ok",
+        "payload": {
+            "nested": {
+                "rows": [
+                    {"TELEFON": "905466033161", "DAHİLİ ADI": "asu"},
+                ]
+            }
+        },
+    }
+    rows = TonivaClient._extract_rows(data)
+    assert len(rows) == 1
+    assert rows[0]["TELEFON"] == "905466033161"
+
+
+def test_date_chunks():
+    chunks = TonivaClient._date_chunks(date(2026, 6, 25), date(2026, 7, 25), max_days=14)
+    assert chunks[0][0] == date(2026, 6, 25)
+    assert chunks[-1][1] == date(2026, 7, 25)
+    # örtüşmesiz
+    for i in range(len(chunks) - 1):
+        assert chunks[i][1] < chunks[i + 1][0]
