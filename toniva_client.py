@@ -209,37 +209,134 @@ class TonivaClient:
         start: date,
         end: date,
         on_progress: ProgressCb = None,
-        timeout_sec: float = 45.0,
+        timeout_sec: float = 120.0,
     ) -> SearchResult:
         """
-        1) Cache hit → anında
-        2) Gün gün (yeniden eskiye) sayfala, eşleşince dur
-        Kilit / wait_for yok (event loop'u kilitlemesin).
+        1) API'ye numara ile sor (phone/Phone query) — 1–2 istek
+        2) Tüm aralığı sayfala (yeniden eskiye); ilk eşleşmede DUR
         """
         target = normalize_tr_phone(phone) or phone
-        deadline = asyncio.get_event_loop().time() + max(5.0, timeout_sec)
 
-        # 1) Cache
-        if self.cache is not None:
-            try:
-                cached = self.cache.find_latest(target)
-            except Exception:
-                logger.exception("cache okuma hatası")
-                cached = None
-            if cached is not None and start <= cached.sort_key.date() <= end:
-                return SearchResult(
-                    record=cached,
-                    match_count=1,
-                    source="cache",
-                    note="yerel önbellek",
-                )
+        # 1) Direkt numara filtresi (OpenAPI'de yok ama çoğu CRM destekler)
+        if on_progress:
+            await _safe_progress(on_progress, "Numara ile API sorgusu…")
+        filtered = await self._try_direct_phone_query(target, start, end)
+        if filtered is not None:
+            return filtered
 
-        # 2) Gün gün tarama
-        return await self._search_day_by_day(
+        # 2) Akış tarama — bulunca çık (yanlış "süre doldu=yok" için süre uzun)
+        if on_progress:
+            await _safe_progress(on_progress, "Kayıtlar taranıyor…")
+        deadline = asyncio.get_event_loop().time() + max(30.0, timeout_sec)
+        return await self._stream_search(
             target, start, end, on_progress, deadline=deadline
         )
 
-    async def _search_day_by_day(
+    async def _try_direct_phone_query(
+        self,
+        target: str,
+        start: date,
+        end: date,
+    ) -> SearchResult | None:
+        """
+        GET .../conversations?phone=90... 
+        Filtre yok sayılıyorsa (devasa total / karışık numaralar) None.
+        """
+        # Tek seferlik keşif; çalışan param hafızada
+        if getattr(self, "_phone_param", None) is False:
+            return None
+
+        keys: list[str]
+        if isinstance(getattr(self, "_phone_param", None), str):
+            keys = [self._phone_param]  # type: ignore[list-item]
+        else:
+            keys = ["phone", "Phone", "search"]
+
+        variants = [target]
+        if target.startswith("90") and len(target) >= 12:
+            variants.append("0" + target[2:])
+            variants.append(target[-10:])
+
+        for key in keys:
+            for val in variants:
+                try:
+                    data = await self._get_report(
+                        {
+                            "startDate": start.isoformat(),
+                            "endDate": end.isoformat(),
+                            "pageSize": 100,
+                            "page": 1,
+                            key: val,
+                        }
+                    )
+                except RuntimeError as exc:
+                    if "400" in str(exc):
+                        break  # bu key geçersiz
+                    logger.warning("direct phone query hata: %s", exc)
+                    return None
+
+                rows = self._extract_rows(data)
+                meta = self._extract_meta(data)
+                total = self._meta_total_count(meta)
+
+                matches: list[CallRecord] = []
+                other = 0
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    rec = self._match_row_to_phone(self._flatten_row(row), target)
+                    if rec:
+                        matches.append(rec)
+                    else:
+                        other += 1
+
+                # Param yok sayılmış
+                if total is not None and total > 200:
+                    logger.info(
+                        "phone query yok sayıldı key=%s total=%s", key, total
+                    )
+                    break  # aynı key'in diğer varyantına gerek yok
+                if len(rows) >= 20 and other > max(2, len(matches)):
+                    break
+
+                if matches:
+                    self._phone_param = key
+                    latest = max(matches, key=lambda r: r.sort_key)
+                    logger.info(
+                        "Direkt phone query OK key=%s val=%s agent=%s",
+                        key,
+                        val,
+                        latest.agent_name,
+                    )
+                    return SearchResult(
+                        record=latest,
+                        row_count=len(rows),
+                        match_count=len(matches),
+                        meta_summary={
+                            **meta,
+                            "filter": key,
+                            "filter_value": val,
+                            "total_count": total,
+                        },
+                        source="phone_query",
+                        note=f"API ?{key}=",
+                    )
+
+                # Filtre çalıştı, bu numaraya ait yok
+                if total == 0 or (total is not None and total <= 5 and not matches):
+                    self._phone_param = key
+                    return SearchResult(
+                        record=None,
+                        row_count=len(rows),
+                        meta_summary={**meta, "filter": key},
+                        source="phone_query",
+                        note=f"API filtre ({key}) ile kayıt yok",
+                    )
+
+        self._phone_param = False
+        return None
+
+    async def _stream_search(
         self,
         target: str,
         start: date,
@@ -247,102 +344,50 @@ class TonivaClient:
         on_progress: ProgressCb,
         deadline: float | None = None,
     ) -> SearchResult:
-        """En yeniden eskiye gün gün; gün içinde sayfalarken eşleşince dön."""
-        days: list[date] = []
-        d = end
-        while d >= start:
-            days.append(d)
-            d -= timedelta(days=1)
-
-        total_rows = 0
+        """
+        startDate–endDate tek pencerede sayfala.
+        API genelde yeniden eskiye: ilk eşleşme = en son arama → DUR.
+        """
+        page = 1
+        # OpenAPI max 5000; API 200 dönerse effective_size ile devam
+        req_size = 5000
+        row_count = 0
+        total: int | None = None
+        seen_ids: set[str] = set()
+        mode = self._pagination_mode
         sample_keys: list[str] = []
         sample_phones: list[str] = []
         last_meta: dict[str, Any] = {}
         loop = asyncio.get_event_loop()
+        effective = 0
 
-        for i, day in enumerate(days):
+        while page <= 300:
             if deadline is not None and loop.time() >= deadline:
                 return SearchResult(
                     record=None,
-                    row_count=total_rows,
+                    row_count=row_count,
                     source="timeout",
-                    note="Süre doldu, numara henüz bulunamadı",
-                    meta_summary={"days_scanned": i, "fetched_count": total_rows},
-                )
-
-            if on_progress:
-                await _safe_progress(
-                    on_progress,
-                    f"{day.strftime('%d.%m.%Y')} ({i + 1}/{len(days)})",
-                )
-
-            best, rows_n, meta, keys, phones = await self._scan_day_for_phone(
-                target, day
-            )
-            last_meta = meta
-            total_rows += rows_n
-            if keys and not sample_keys:
-                sample_keys = keys
-                sample_phones = phones
-
-            if best is not None:
-                if self.cache is not None:
-                    try:
-                        self.cache.upsert_records([best])
-                    except Exception:
-                        logger.exception("cache yazılamadı")
-                return SearchResult(
-                    record=best,
-                    row_count=total_rows,
-                    parsed_count=1,
-                    match_count=1,
+                    note=(
+                        f"Tarama süresi doldu ({row_count} satır bakıldı). "
+                        "Kayıt daha eski sayfalarda olabilir — tekrar dene."
+                    ),
+                    meta_summary={
+                        "fetched_count": row_count,
+                        "total_count": total,
+                        "pages": page,
+                    },
                     sample_keys=sample_keys,
                     sample_phone_values=sample_phones,
-                    meta_summary={
-                        **last_meta,
-                        "fetched_count": total_rows,
-                        "days_scanned": i + 1,
-                        "early_exit": True,
-                    },
-                    source="scan",
-                    note=f"gün taraması: {day.isoformat()}",
                 )
 
-        return SearchResult(
-            record=None,
-            row_count=total_rows,
-            sample_keys=sample_keys,
-            sample_phone_values=sample_phones,
-            meta_summary={
-                **last_meta,
-                "fetched_count": total_rows,
-                "days_scanned": len(days),
-            },
-            source="scan",
-            note="Tüm günler tarandı, numara yok",
-        )
+            if on_progress and (page == 1 or page % 3 == 0):
+                tot = f"/{total}" if total else ""
+                await _safe_progress(
+                    on_progress, f"Sayfa {page} (satır {row_count}{tot})…"
+                )
 
-    async def _scan_day_for_phone(
-        self, target: str, day: date
-    ) -> tuple[CallRecord | None, int, dict[str, Any], list[str], list[str]]:
-        """
-        Tek günü sayfala. İlk eşleşme sayfasında o sayfadaki en yeni kaydı dön.
-        Duplicate sayfa (page yok sayılırsa) algılanır → offset moduna geç.
-        """
-        page = 1
-        row_count = 0
-        total: int | None = None
-        seen_ids: set[str] = set()
-        sample_keys: list[str] = []
-        sample_phones: list[str] = []
-        last_meta: dict[str, Any] = {}
-        mode = self._pagination_mode
-        page_size = 200  # canlı API fiilen ~200; net adımlar
-        empty_dup_pages = 0
-
-        while page <= 80:
             data = await self._get_report(
-                self._page_params(day, day, page, page_size, mode)
+                self._page_params(start, end, page, req_size, mode)
             )
             batch = self._extract_rows(data)
             meta = self._extract_meta(data)
@@ -354,16 +399,13 @@ class TonivaClient:
             if not batch:
                 break
 
-            # Duplicate page detection
+            if effective == 0:
+                effective = len(batch)
+
             batch_ids = [self._row_id(r) for r in batch if isinstance(r, dict)]
             new_ids = [i for i in batch_ids if i not in seen_ids]
             if page > 1 and batch_ids and not new_ids:
-                empty_dup_pages += 1
-                logger.warning(
-                    "Duplicate sayfa algılandı mode=%s page=%s → mod değiştir",
-                    mode,
-                    page,
-                )
+                logger.warning("duplicate page mode=%s page=%s", mode, page)
                 if mode == "page":
                     mode = "offset"
                     self._pagination_mode = "offset"
@@ -371,7 +413,6 @@ class TonivaClient:
                     seen_ids.clear()
                     row_count = 0
                     continue
-                # offset de kopya → kes
                 last_meta["pagination_broken"] = True
                 break
             for i in batch_ids:
@@ -381,18 +422,8 @@ class TonivaClient:
 
             if not sample_keys and isinstance(batch[0], dict):
                 flat0 = self._flatten_row(batch[0])
-                sample_keys = list(flat0.keys())[:40]
+                sample_keys = list(flat0.keys())[:30]
                 sample_phones = self._collect_phone_like_values(flat0, limit=6)
-
-            # Cache'e yaz + eşleşme ara
-            if self.cache is not None:
-                try:
-                    self.cache.upsert_raw_rows(
-                        [r for r in batch if isinstance(r, dict)],
-                        parse_fn=lambda r: self._parse_row(self._flatten_row(r)),
-                    )
-                except Exception:
-                    logger.exception("cache upsert hata")
 
             page_matches: list[CallRecord] = []
             for row in batch:
@@ -403,28 +434,56 @@ class TonivaClient:
                     page_matches.append(rec)
 
             if page_matches:
-                best = max(page_matches, key=lambda r: r.sort_key)
-                last_meta = {
-                    **last_meta,
-                    "total_count": total,
-                    "fetched_count": row_count,
-                    "page": page,
-                    "mode": mode,
-                }
-                return best, row_count, last_meta, sample_keys, sample_phones
+                # Bu sayfadaki en yeni = genel en son (yeniden→eskiye sıra)
+                latest = max(page_matches, key=lambda r: r.sort_key)
+                logger.info(
+                    "Eşleşme sayfa=%s agent=%s %s %s rows=%s",
+                    page,
+                    latest.agent_name,
+                    latest.call_date,
+                    latest.call_time,
+                    row_count,
+                )
+                return SearchResult(
+                    record=latest,
+                    row_count=row_count,
+                    match_count=len(page_matches),
+                    sample_keys=sample_keys,
+                    sample_phone_values=sample_phones,
+                    meta_summary={
+                        **last_meta,
+                        "total_count": total,
+                        "fetched_count": row_count,
+                        "pages_scanned": page,
+                        "early_exit": True,
+                    },
+                    source="stream",
+                    note=f"sayfa {page}",
+                )
 
             if total is not None and row_count >= total:
-                break
-            if len(batch) < page_size and (total is None or row_count >= (total or 0)):
                 break
             if total is not None and row_count < total:
                 page += 1
                 continue
-            if len(batch) < page_size:
+            if len(batch) < (effective or req_size):
                 break
             page += 1
 
-        return None, row_count, last_meta, sample_keys, sample_phones
+        return SearchResult(
+            record=None,
+            row_count=row_count,
+            sample_keys=sample_keys,
+            sample_phone_values=sample_phones,
+            meta_summary={
+                **last_meta,
+                "total_count": total,
+                "fetched_count": row_count,
+                "pages_scanned": page,
+            },
+            source="stream",
+            note="Tüm sayfalar tarandı, numara yok",
+        )
 
     def _page_params(
         self,

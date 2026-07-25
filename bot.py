@@ -123,20 +123,32 @@ async def kt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     start, end = _lookback_range(settings)
     wait = await msg.reply_text(
-        f"🔍 Taranıyor…\n<code>{_esc(phone)}</code>",
+        f"🔍 Sorgulanıyor…\n<code>{_esc(phone)}</code>",
         parse_mode=ParseMode.HTML,
     )
 
+    async def progress(text: str) -> None:
+        try:
+            await wait.edit_text(
+                f"🔍 {_esc(text)}\n<code>{_esc(phone)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
     try:
-        result = await client.find_latest_call(phone, start, end)
+        result = await client.find_latest_call(
+            phone, start, end, on_progress=progress, timeout_sec=120.0
+        )
     except Exception as exc:
         logger.exception("sorgu hatası")
         await wait.edit_text(f"⚠️ Sorgulanamadı: {_esc(str(exc))[:400]}")
         return
 
     if result.record is None:
+        title = "⏱ TARAMA BİTMEDİ" if result.source == "timeout" else "❌ BULUNAMADI"
         await wait.edit_text(
-            f"❌ <b>BULUNAMADI</b>\n"
+            f"<b>{title}</b>\n"
             f"Numara: <code>{_esc(phone)}</code>\n"
             f"Aralık: {start} → {end}\n"
             f"Not: {_esc(result.note or 'kayıt yok')}",
