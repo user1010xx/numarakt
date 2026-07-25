@@ -89,18 +89,16 @@ async def test_find_number_on_later_page():
 
     client._get_report = fake_get  # type: ignore[method-assign]
 
-    # fetch_conversations tek pencere (aynı gün)
-    rows, meta = await client.fetch_conversations(
-        date(2026, 7, 21), date(2026, 7, 21)
-    )
-    assert len(rows) == 600
-
     result = await client.find_latest_call(
         target, date(2026, 7, 21), date(2026, 7, 21)
     )
     assert result.record is not None
     assert result.record.phone == target
     assert result.record.agent_name == "asu"
+    # idx=450 → 3. sayfa; erken çıkış — 600 satırın tamamı çekilmez
+    assert result.row_count == 600  # 3*200
+    assert result.meta_summary.get("early_exit") is True
+    assert result.meta_summary.get("pages_scanned") == 3
 
 
 def test_live_schema_row_parse():

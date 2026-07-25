@@ -281,7 +281,8 @@ class TonivaClient:
                 "Authorization": f"Bearer {api_key}",
                 "Accept": "application/json",
             },
-            timeout=timeout,
+            # Sayfalama + 429 bekleme için uzun timeout
+            timeout=httpx.Timeout(timeout, connect=30.0),
         )
         self._logged_schema = False
 
@@ -293,202 +294,228 @@ class TonivaClient:
         phone: str,
         start: date,
         end: date,
+        on_progress: Any | None = None,
     ) -> SearchResult:
-        """Son N gün içinde numaraya ait en son kaydı bul (teşhis sayaçlarıyla)."""
-        target = normalize_tr_phone(phone) or phone
-        rows, meta = await self.fetch_conversations(start, end)
+        """
+        Numaraya ait en son aramayı bul.
 
+        Hız stratejisi (canlı ~20k satır):
+        - Tek tarih aralığında sayfa sayfa ilerle
+        - API genelde en yeniden eskiye sıralı → **ilk eşleşmede dur**
+          (daha eski sayfalarda daha yeni arama olmaz)
+        - Böylece tüm 20k'yı indirmeden saniyeler içinde sonuç
+        """
+        target = normalize_tr_phone(phone) or phone
+        requested_page_size = 5000
+        page = 1
+        total: int | None = None
+        row_count = 0
+        parsed = 0
+        effective_page_size: int | None = None
         sample_keys: list[str] = []
         sample_phones: list[str] = []
-        if rows and isinstance(rows[0], dict):
-            flat0 = self._flatten_row(rows[0])
-            sample_keys = list(flat0.keys())[:40]
-            sample_phones = self._collect_phone_like_values(flat0, limit=8)
+        last_meta: dict[str, Any] = {}
 
-        if not rows:
-            # Ham JSON şeklini bir kez logla
-            logger.warning(
-                "conversations boş döndü (%s → %s) meta=%s",
-                start.isoformat(),
-                end.isoformat(),
-                meta,
+        while True:
+            data = await self._get_report(
+                {
+                    "startDate": start.isoformat(),
+                    "endDate": end.isoformat(),
+                    "pageSize": requested_page_size,
+                    "page": page,
+                }
             )
+            batch = self._extract_rows(data)
+            meta = self._extract_meta(data)
+            last_meta = meta
+            t = self._meta_total_count(meta)
+            if total is None and t is not None:
+                total = t
+
+            if page == 1 and not batch:
+                data2 = await self._get_report(
+                    {
+                        "startDate": start.isoformat(),
+                        "endDate": end.isoformat(),
+                    }
+                )
+                batch = self._extract_rows(data2)
+                meta = self._extract_meta(data2)
+                last_meta = meta
+                t = self._meta_total_count(meta)
+                if total is None and t is not None:
+                    total = t
+
+            if on_progress is not None:
+                try:
+                    await on_progress(page, row_count, total)
+                except Exception:
+                    logger.debug("on_progress hata", exc_info=True)
+
+            if not batch:
+                break
+
+            if effective_page_size is None:
+                effective_page_size = len(batch)
+
+            row_count += len(batch)
+
+            if not sample_keys and isinstance(batch[0], dict):
+                flat0 = self._flatten_row(batch[0])
+                sample_keys = list(flat0.keys())[:40]
+                sample_phones = self._collect_phone_like_values(flat0, limit=8)
+
+            page_matches: list[CallRecord] = []
+            for row in batch:
+                if not isinstance(row, dict):
+                    continue
+                flat = self._flatten_row(row)
+                rec = self._match_row_to_phone(flat, target)
+                if rec is None:
+                    continue
+                parsed += 1
+                page_matches.append(rec)
+
+            if page_matches:
+                # Bu sayfadaki en son arama = genel en son (yeni→eski sıra varsayımı)
+                latest = max(page_matches, key=lambda r: r.sort_key)
+                logger.info(
+                    "İlk eşleşme sayfa=%s agent=%s %s %s (taranan_satır=%s/%s)",
+                    page,
+                    latest.agent_name,
+                    latest.call_date,
+                    latest.call_time,
+                    row_count,
+                    total,
+                )
+                if not self._logged_schema and sample_keys:
+                    self._logged_schema = True
+                    logger.info(
+                        "Toniva conversations örnek alanlar: %s | total=%s",
+                        sample_keys[:20],
+                        total,
+                    )
+                return SearchResult(
+                    record=latest,
+                    row_count=row_count,
+                    parsed_count=parsed,
+                    match_count=len(page_matches),
+                    sample_keys=sample_keys,
+                    sample_phone_values=sample_phones,
+                    meta_summary={
+                        **last_meta,
+                        "total_count": total,
+                        "fetched_count": row_count,
+                        "pages_scanned": page,
+                        "early_exit": True,
+                    },
+                )
+
+            # Sonraki sayfa?
+            if total is not None and row_count >= total:
+                break
+            if total is not None and row_count < total:
+                page += 1
+                if page > 500:
+                    logger.warning("sayfalama 500 sayfada kesildi")
+                    break
+                continue
+
+            page_cap = effective_page_size or requested_page_size
+            if len(batch) < page_cap:
+                break
+            page += 1
+            if page > 500:
+                break
+
+        if row_count == 0:
             return SearchResult(
                 record=None,
                 row_count=0,
-                meta_summary=meta,
+                meta_summary=last_meta,
                 sample_keys=sample_keys,
                 sample_phone_values=sample_phones,
-                note="API 0 satır döndü (şema/tenant/tarih veya satır çıkarımı)",
+                note="API 0 satır döndü",
             )
 
-        matches: list[tuple[CallRecord, dict[str, Any]]] = []
-        parsed = 0
-        scanned_match = 0
-
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            flat = self._flatten_row(row)
-
-            # 1) Önce satırın HER skaler değerinde numara ara (alan adı bağımsız)
-            row_hit = self._row_contains_phone(flat, target)
-            if row_hit:
-                scanned_match += 1
-
-            rec = self._parse_row(flat)
-            if rec is None:
-                if not row_hit:
-                    continue
-                # Numara satırda var ama parse başarısız → yine de kayıt üret
-                rec = self._record_from_flat(flat, phone_fallback=target)
-                if rec is None:
-                    continue
-
-            parsed += 1
-            if row_hit or phones_equal(rec.phone, target):
-                # Gösterim telefonunu hedefe sabitle (dahili gölgelemesi kalmasın)
-                if not phones_equal(rec.phone, target):
-                    rec = CallRecord(
-                        agent_name=rec.agent_name,
-                        phone=target,
-                        call_date=rec.call_date,
-                        call_time=rec.call_time,
-                        talk_seconds=rec.talk_seconds,
-                        sort_key=rec.sort_key,
-                    )
-                matches.append((rec, flat))
-
-        if parsed == 0 and scanned_match == 0:
-            logger.error(
-                "Satırlar geldi ama telefon okunamadı. keys=%s sample_phones=%s",
-                sample_keys[:30],
-                sample_phones,
-            )
-            raise RuntimeError(
-                "Toniva satırları geldi ama telefon alanı okunamadı. "
-                f"Örnek alan adları: {sample_keys[:30]}. "
-                f"Örnek değerler: {sample_phones[:8]}. "
-                "toniva_client alan eşlemesi güncellenmeli."
-            )
-
-        if not matches:
-            # Daha fazla örnek telefon topla (ilk 20 satır)
-            for row in rows[:20]:
-                if isinstance(row, dict):
-                    sample_phones.extend(
-                        self._collect_phone_like_values(self._flatten_row(row), limit=3)
-                    )
-            # tekilleştir
-            seen: set[str] = set()
-            uniq_phones: list[str] = []
-            for p in sample_phones:
-                if p not in seen:
-                    seen.add(p)
-                    uniq_phones.append(p)
-            sample_phones = uniq_phones[:12]
-
-            logger.info(
-                "Numara eşleşmedi: target=%s satır=%s parse=%s scan_hit=%s örnek_tel=%s",
-                target,
-                len(rows),
-                parsed,
-                scanned_match,
-                sample_phones,
-            )
-            return SearchResult(
-                record=None,
-                row_count=len(rows),
-                parsed_count=parsed,
-                match_count=0,
-                sample_keys=sample_keys,
-                sample_phone_values=sample_phones,
-                meta_summary=meta,
-                note="Satırlar var, numara hiçbir alanda yok (veya maskeli)",
-            )
-
-        # Aynı numarayı birden fazla personel aramış olabilir → en son arama
-        idx, (latest, raw) = max(
-            enumerate(matches),
-            key=lambda pair: (pair[1][0].sort_key, pair[0]),
-        )
         logger.info(
-            "En son arama seçildi: phone=%s agent=%s at=%s %s talk=%ss (eşleşme=%s)",
-            latest.phone,
-            latest.agent_name,
-            latest.call_date,
-            latest.call_time,
-            latest.talk_seconds,
-            len(matches),
+            "Numara eşleşmedi: target=%s satır=%s sayfa=%s",
+            target,
+            row_count,
+            page,
         )
-        if latest.talk_seconds == 0:
-            logger.warning(
-                "talk=0 ham satır alanları: %s",
-                {k: raw.get(k) for k in list(raw.keys())[:40]},
-            )
         return SearchResult(
-            record=latest,
-            row_count=len(rows),
+            record=None,
+            row_count=row_count,
             parsed_count=parsed,
-            match_count=len(matches),
+            match_count=0,
             sample_keys=sample_keys,
             sample_phone_values=sample_phones,
-            meta_summary=meta,
+            meta_summary={
+                **last_meta,
+                "total_count": total,
+                "fetched_count": row_count,
+                "pages_scanned": page,
+            },
+            note="Tüm sayfalar tarandı, numara yok",
         )
+
+    def _match_row_to_phone(
+        self, flat: dict[str, Any], target: str
+    ) -> CallRecord | None:
+        """Satır hedef numaraya aitse CallRecord döndür."""
+        row_hit = self._row_contains_phone(flat, target)
+        rec = self._parse_row(flat)
+        if rec is None:
+            if not row_hit:
+                return None
+            rec = self._record_from_flat(flat, phone_fallback=target)
+            if rec is None:
+                return None
+        elif not (row_hit or phones_equal(rec.phone, target)):
+            return None
+
+        if not phones_equal(rec.phone, target):
+            rec = CallRecord(
+                agent_name=rec.agent_name,
+                phone=target,
+                call_date=rec.call_date,
+                call_time=rec.call_time,
+                talk_seconds=rec.talk_seconds,
+                sort_key=rec.sort_key,
+            )
+        return rec
 
     async def fetch_conversations(
         self, start: date, end: date
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """
-        conversations raporunu çeker.
+        Tüm pencereyi çeker (tek tarih aralığı, tam sayfalama).
 
-        Canlı hata: API pageSize=1000 istense bile ~200 satır döndürüp
-        total_count=20880 veriyordu; kısa sayfada durmak 400/20880 satırda
-        kesiyordu → numara set dışında kalıp BULUNAMADI.
-
-        Strateji: total_count bitene kadar sayfala; büyük pencereleri
-        günlük parçala (rate limit + erken arama için).
+        Not: /kt araması find_latest_call ile günden-geriye erken çıkış kullanır;
+        bu metod toplu çekim / test içindir.
         """
-        chunks = self._date_chunks(start, end, max_days=3)
-        all_rows: list[dict[str, Any]] = []
-        last_meta: dict[str, Any] = {}
-        seen_ids: set[str] = set()
-        total_reported = 0
-        total_fetched = 0
+        rows, meta = await self._fetch_window_paginated(start, end)
 
-        for c_start, c_end in chunks:
-            rows, meta = await self._fetch_window_paginated(c_start, c_end)
-            last_meta = meta
-            total_reported += int(meta.get("total_count") or 0)
-            total_fetched += int(meta.get("fetched_count") or len(rows))
-            for r in rows:
-                rid = self._row_dedupe_key(r)
-                if rid in seen_ids:
-                    continue
-                seen_ids.add(rid)
-                all_rows.append(r)
-
-        last_meta = {
-            **last_meta,
-            "total_count": total_reported or last_meta.get("total_count"),
-            "fetched_count": len(all_rows),
-            "windows": len(chunks),
-        }
-
-        if all_rows and isinstance(all_rows[0], dict) and not self._logged_schema:
+        if rows and isinstance(rows[0], dict) and not self._logged_schema:
             self._logged_schema = True
             logger.info(
-                "Toniva conversations örnek alanlar: %s | meta=%s | toplam_satır=%s parçalar=%s",
-                list(all_rows[0].keys())[:40],
+                "Toniva conversations örnek alanlar: %s | meta=%s | toplam_satır=%s",
+                list(rows[0].keys())[:40],
                 {
-                    k: last_meta.get(k)
-                    for k in ("total_count", "truncated", "page", "page_size", "fetched_count")
+                    k: meta.get(k)
+                    for k in (
+                        "total_count",
+                        "truncated",
+                        "page",
+                        "page_size",
+                        "fetched_count",
+                    )
                 },
-                len(all_rows),
-                len(chunks),
+                len(rows),
             )
 
-        return all_rows, last_meta
+        return rows, meta
 
     @staticmethod
     def _date_chunks(start: date, end: date, max_days: int = 14) -> list[tuple[date, date]]:

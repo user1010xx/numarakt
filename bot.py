@@ -121,13 +121,32 @@ async def kt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     start, end = _lookback_range(settings)
     wait = await update.effective_message.reply_text(
-        f"🔍 Son {settings.lookback_days} gün taranıyor…\n"
-        f"<code>{_esc(normalized)}</code>",
+        f"🔍 Aranıyor…\n<code>{_esc(normalized)}</code>",
         parse_mode=ParseMode.HTML,
     )
 
+    _last_progress_page = {"n": 0}
+
+    async def on_progress(page: int, rows_so_far: int, total_hint: int | None) -> None:
+        # Her sayfada değil; 1. ve her 3. sayfada güncelle (Telegram flood)
+        if page > 1 and page - _last_progress_page["n"] < 3:
+            return
+        _last_progress_page["n"] = page
+        total_txt = f"/{total_hint}" if total_hint else ""
+        try:
+            await wait.edit_text(
+                f"🔍 Aranıyor… sayfa <b>{page}</b> "
+                f"(satır {rows_so_far}{total_txt})\n"
+                f"<code>{_esc(normalized)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
     try:
-        result = await client.find_latest_call(normalized, start, end)
+        result = await client.find_latest_call(
+            normalized, start, end, on_progress=on_progress
+        )
     except Exception as exc:
         logger.exception("Sorgulama hatası")
         await wait.edit_text(f"⚠️ Sorgulanamadı: {_esc(str(exc))}")

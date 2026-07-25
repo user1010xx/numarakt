@@ -122,36 +122,36 @@ def test_columns_as_objects_with_list_rows(client: TonivaClient):
 
 
 def test_find_latest_among_matches(client: TonivaClient, monkeypatch: pytest.MonkeyPatch):
-    """Aynı numaraya birden fazla arama → en son tarih."""
+    """Aynı sayfada birden fazla arama → en son tarih."""
 
-    async def fake_fetch(start: date, end: date):
-        return [
-            {
-                "TELEFON": "905466033161",
-                "DAHİLİ ADI": "eski",
-                "TARİH": "2026-07-10",
-                "SAAT": "10:00:00",
-                "GÖRÜŞME SÜRESİ": "00:00:30",
-            },
-            {
-                "TELEFON": "905466033161",
-                "DAHİLİ ADI": "asu",
-                "TARİH": "Salı 21 Temmuz 2026",
-                "SAAT": "13:23:22",
-                "GÖRÜŞME SÜRESİ": "00:01:06",
-            },
-            {
-                "TELEFON": "905551112233",
-                "DAHİLİ ADI": "diger",
-                "TARİH": "2026-07-22",
-                "SAAT": "09:00:00",
-            },
-        ]
+    async def fake_get(params):
+        return {
+            "meta": {"total_count": 3},
+            "rows": [
+                {
+                    "TELEFON": "905466033161",
+                    "DAHİLİ ADI": "eski",
+                    "TARİH": "2026-07-10",
+                    "SAAT": "10:00:00",
+                    "GÖRÜŞME SÜRESİ": "00:00:30",
+                },
+                {
+                    "TELEFON": "905466033161",
+                    "DAHİLİ ADI": "asu",
+                    "TARİH": "Salı 21 Temmuz 2026",
+                    "SAAT": "13:23:22",
+                    "GÖRÜŞME SÜRESİ": "00:01:06",
+                },
+                {
+                    "TELEFON": "905551112233",
+                    "DAHİLİ ADI": "diger",
+                    "TARİH": "2026-07-22",
+                    "SAAT": "09:00:00",
+                },
+            ],
+        }
 
-    async def fake_fetch_wrap(start: date, end: date):
-        return await fake_fetch(start, end), {}
-
-    monkeypatch.setattr(client, "fetch_conversations", fake_fetch_wrap)
+    monkeypatch.setattr(client, "_get_report", fake_get)
 
     import asyncio
 
@@ -167,25 +167,26 @@ def test_find_latest_among_matches(client: TonivaClient, monkeypatch: pytest.Mon
     assert result.record.call_date == "21.07.2026"
     assert result.record.call_time == "13:23:22"
     assert result.match_count >= 1
+    assert result.meta_summary.get("early_exit") is True
 
 
 def test_find_latest_miss_when_only_other_numbers(
     client: TonivaClient, monkeypatch: pytest.MonkeyPatch
 ):
-    async def fake_fetch(start: date, end: date):
-        return [
-            {
-                "phone": "605",
-                "dst": "905551112233",
-                "cnam": "x",
-                "calldate": "2026-07-21 12:00:00",
-            }
-        ]
+    async def fake_get(params):
+        return {
+            "meta": {"total_count": 1},
+            "rows": [
+                {
+                    "phone": "605",
+                    "dst": "905551112233",
+                    "cnam": "x",
+                    "calldate": "2026-07-21 12:00:00",
+                }
+            ],
+        }
 
-    async def fake_fetch_wrap(start: date, end: date):
-        return await fake_fetch(start, end), {}
-
-    monkeypatch.setattr(client, "fetch_conversations", fake_fetch_wrap)
+    monkeypatch.setattr(client, "_get_report", fake_get)
 
     import asyncio
 
@@ -205,28 +206,28 @@ def test_regression_user_case_extension_shadowing(
 ):
     """Kullanıcı senaryosu: Dış Arama asu/605 → 905466033161."""
 
-    async def fake_fetch(start: date, end: date):
-        return [
-            {
-                "YÖN": "Dış Arama",
-                "phone": "605",
-                "number": "605",
-                "src": "605",
-                "dst": "905466033161",
-                "TELEFON": "905466033161",
-                "DAHİLİ ADI": "asu",
-                "DAHİLİ NUMARASI": "605",
-                "TARİH": "Salı 21 Temmuz 2026",
-                "SAAT": "13:23:22",
-                "GÖRÜŞME SÜRESİ": "00:01:06",
-                "ÇALDIRMA SÜRESİ": "00:00:07",
-            }
-        ]
+    async def fake_get(params):
+        return {
+            "meta": {"total_count": 1},
+            "rows": [
+                {
+                    "YÖN": "Dış Arama",
+                    "phone": "605",
+                    "number": "605",
+                    "src": "605",
+                    "dst": "905466033161",
+                    "TELEFON": "905466033161",
+                    "DAHİLİ ADI": "asu",
+                    "DAHİLİ NUMARASI": "605",
+                    "TARİH": "Salı 21 Temmuz 2026",
+                    "SAAT": "13:23:22",
+                    "GÖRÜŞME SÜRESİ": "00:01:06",
+                    "ÇALDIRMA SÜRESİ": "00:00:07",
+                }
+            ],
+        }
 
-    async def fake_fetch_wrap(start: date, end: date):
-        return await fake_fetch(start, end), {}
-
-    monkeypatch.setattr(client, "fetch_conversations", fake_fetch_wrap)
+    monkeypatch.setattr(client, "_get_report", fake_get)
 
     import asyncio
 
@@ -246,19 +247,19 @@ def test_regression_user_case_extension_shadowing(
 def test_match_phone_in_unknown_field(client: TonivaClient, monkeypatch: pytest.MonkeyPatch):
     """Alan adı bilinmese bile değer taraması ile bulunur."""
 
-    async def fake_fetch(start: date, end: date):
-        return [
-            {
-                "weirdField": "905466033161",
-                "agentLabel": "asu",
-                "when": "2026-07-21 13:23:22",
-            }
-        ]
+    async def fake_get(params):
+        return {
+            "meta": {"total_count": 1},
+            "rows": [
+                {
+                    "weirdField": "905466033161",
+                    "agentLabel": "asu",
+                    "when": "2026-07-21 13:23:22",
+                }
+            ],
+        }
 
-    async def fake_fetch_wrap(start: date, end: date):
-        return await fake_fetch(start, end), {"total_count": 1}
-
-    monkeypatch.setattr(client, "fetch_conversations", fake_fetch_wrap)
+    monkeypatch.setattr(client, "_get_report", fake_get)
 
     import asyncio
 
