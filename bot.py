@@ -1,29 +1,39 @@
 """
 Toniva Görüşme Raporu kontrol botu.
 
-Kullanım (yalnızca grup/supergroup):
   /kt 905551112233
-  /ping  → sağlık kontrolü
+  /ping
 """
 
 from __future__ import annotations
 
 import logging
 import re
+import sys
+import traceback
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
+# Railway log'larda hemen görünsün (buffer yok)
+print("BOT_ENTRY: bot.py yüklendi", flush=True)
 
 from telegram import Update
 from telegram.constants import ChatType, ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+print("BOT_ENTRY: telegram import OK", flush=True)
+
 from config import Settings, load_settings
 from phone_utils import normalize_tr_phone
 from toniva_client import TonivaClient
 
+print("BOT_ENTRY: local import OK", flush=True)
+
 logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     level=logging.INFO,
+    stream=sys.stdout,
+    force=True,
 )
 logger = logging.getLogger("kt-bot")
 
@@ -68,6 +78,7 @@ def _format_found(record) -> str:
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message:
         return
+    logger.info("/ping chat_id=%s", update.effective_chat.id if update.effective_chat else None)
     await update.effective_message.reply_text("pong ✅ bot çalışıyor")
 
 
@@ -87,13 +98,12 @@ async def kt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         (msg.text or "")[:100],
     )
 
-    # Sadece grup (eski davranış) — ama özelde bilgi ver ki "ölü bot" sanılmasın
     if not _is_group(chat.type):
-        await msg.reply_text("Bu bot yalnızca gruplarda /kt komutunu yanıtlar.")
+        await msg.reply_text("Bu bot yalnızca gruplarda /kt komutunu yanıtlar. /ping her yerde çalışır.")
         return
 
     if not _chat_allowed(settings, chat.id):
-        logger.info("izin yok chat_id=%s", chat.id)
+        logger.info("izin yok chat_id=%s allowed=%s", chat.id, settings.allowed_chat_ids)
         await msg.reply_text(
             f"Bu grup listede değil.\nchat_id: <code>{chat.id}</code>",
             parse_mode=ParseMode.HTML,
@@ -154,8 +164,10 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def post_init(app: Application) -> None:
+    print("BOT_ENTRY: post_init", flush=True)
     me = await app.bot.get_me()
     logger.info("Bot hazır: @%s (id=%s)", me.username, me.id)
+    print(f"BOT_ENTRY: get_me OK @{me.username}", flush=True)
 
 
 async def post_shutdown(app: Application) -> None:
@@ -166,15 +178,25 @@ async def post_shutdown(app: Application) -> None:
 
 
 def main() -> None:
+    print("BOT_ENTRY: main() başladı", flush=True)
     settings = load_settings()
+    print(
+        "BOT_ENTRY: settings OK "
+        f"token_len={len(settings.telegram_bot_token)} "
+        f"api_len={len(settings.toniva_api_key)} "
+        f"lookback={settings.lookback_days} "
+        f"allowed={len(settings.allowed_chat_ids) or 'ALL'}",
+        flush=True,
+    )
 
-    # Cache isteğe bağlı — hata olursa bot yine ayağa kalksın
     cache = None
     try:
         from call_cache import CallCache
 
         cache = CallCache(settings.cache_path)
-        logger.info("Cache: %s (%s satır)", settings.cache_path, cache.stats().row_count)
+        logger.info(
+            "Cache: %s (%s satır)", settings.cache_path, cache.stats().row_count
+        )
     except Exception:
         logger.exception("Cache açılamadı, önbelleksiz devam")
 
@@ -183,6 +205,7 @@ def main() -> None:
         base_url=settings.toniva_base_url,
         cache=cache,
     )
+    print("BOT_ENTRY: TonivaClient OK", flush=True)
 
     app = (
         Application.builder()
@@ -199,11 +222,11 @@ def main() -> None:
     app.add_error_handler(on_error)
 
     logger.info(
-        "Başlatılıyor… lookback=%s gün, allowed_chats=%s",
+        "Polling başlıyor… lookback=%s allowed_chats=%s",
         settings.lookback_days,
         sorted(settings.allowed_chat_ids) if settings.allowed_chat_ids else "tüm gruplar",
     )
-    # Orijinal çalışan polling ayarları
+    print("BOT_ENTRY: run_polling()", flush=True)
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
@@ -211,4 +234,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as e:
+        print(f"BOT_FATAL SystemExit: {e}", flush=True)
+        raise
+    except Exception:
+        print("BOT_FATAL crash:", flush=True)
+        traceback.print_exc()
+        sys.exit(1)

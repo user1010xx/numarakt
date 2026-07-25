@@ -1,0 +1,5 @@
+[variables]
+PYTHONUNBUFFERED = "1"
+
+[phases.setup]
+nixPkgs = ["python312", "tzdata"]
