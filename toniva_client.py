@@ -33,25 +33,52 @@ _AGENT_KEYS = (
     "name",
     "dahili",
 )
+# Dış numara adayları (öncelik: müşteri / harici hat — dahili DEĞİL)
 _PHONE_KEYS = (
     "telefon",
     "TELEFON",
     "Telefon",
+    "telefonNumarasi",
+    "telefon_numarasi",
+    "Telefon Numarası",
     "phone",
     "phoneNumber",
     "phone_number",
+    "customerPhone",
+    "customer_phone",
     "caller",
     "callerNumber",
     "caller_number",
     "callee",
     "calleeNumber",
     "callee_number",
-    "number",
     "msisdn",
     "externalNumber",
     "external_number",
+    "connectedNumber",
+    "connected_number",
+    "outbound_cnum",
+    "outboundCnum",
+    "clid",
+    "cnum",
+    "did",
     "dst",
     "src",
+    "number",
+)
+# Dahili / extension — dış numara adayı olarak düşük öncelik
+_EXTENSION_PHONE_KEYS = (
+    "dahiliNumarasi",
+    "dahili_numarasi",
+    "DAHİLİ NUMARASI",
+    "Dahili Numarası",
+    "extension",
+    "extensionNumber",
+    "extension_number",
+    "ext",
+    "exten",
+    "agentExtension",
+    "agent_extension",
 )
 # Tam tarih+saat veya yalnızca tarih taşıyabilen alanlar (öncelik sırası)
 _DATETIME_KEYS = (
@@ -427,11 +454,15 @@ class TonivaClient:
         """Dict satırlar + [col...] / list satır birleşimi."""
         col_names: list[str] | None = None
         if isinstance(columns, list) and columns:
-            col_names = [str(c) for c in columns]
+            col_names = [
+                TonivaClient._column_to_name(c) for c in columns
+            ]
         elif isinstance(columns, dict):
             # {0: "phone", 1: "date"} veya {"fields": [...]}
             if "fields" in columns and isinstance(columns["fields"], list):
-                col_names = [str(c) for c in columns["fields"]]
+                col_names = [
+                    TonivaClient._column_to_name(c) for c in columns["fields"]
+                ]
 
         out: list[dict[str, Any]] = []
         for r in rows:
@@ -442,6 +473,17 @@ class TonivaClient:
                 n = min(len(col_names), len(r))
                 out.append({col_names[i]: r[i] for i in range(n)})
         return out
+
+    @staticmethod
+    def _column_to_name(col: Any) -> str:
+        """columns: 'TELEFON' | {key/label/name/field: ...}"""
+        if isinstance(col, dict):
+            for k in ("key", "name", "field", "label", "id", "slug"):
+                v = col.get(k)
+                if v is not None and str(v).strip():
+                    return str(v).strip()
+            return str(col)
+        return str(col)
 
     @classmethod
     def _flatten_row(cls, row: dict[str, Any], prefix: str = "") -> dict[str, Any]:
@@ -469,13 +511,13 @@ class TonivaClient:
         return meta if isinstance(meta, dict) else {}
 
     def _parse_row(self, row: dict[str, Any]) -> CallRecord | None:
-        phone_raw = self._pick(row, _PHONE_KEYS)
+        phone_raw = self._extract_external_phone(row)
         if phone_raw is None:
             # nested common shapes
             for nest in ("party", "remote", "customer", "contact"):
                 nested = row.get(nest)
                 if isinstance(nested, dict):
-                    phone_raw = self._pick(nested, _PHONE_KEYS)
+                    phone_raw = self._extract_external_phone(nested)
                     if phone_raw is not None:
                         break
 
@@ -508,6 +550,146 @@ class TonivaClient:
             talk_seconds=talk_seconds,
             sort_key=sort_dt,
         )
+
+    @classmethod
+    def _extract_external_phone(cls, row: dict[str, Any]) -> Any | None:
+        """
+        Müşteri / harici telefonu seç.
+
+        Canlı hata: API bazen phone/number/src = dahili (605), dst/telefon = 9054...
+        Eski _pick sırası dahiliyi alıp /kt 9054... için BULUNAMADI üretiyordu.
+        """
+        candidates: list[tuple[int, int, Any]] = []
+        # (score, key_priority, value) — score yüksek, key_priority düşük = daha iyi
+
+        def add(val: Any, *, key_name: str, key_priority: int) -> None:
+            if val is None or val == "":
+                return
+            s = str(val).strip()
+            if not s or s in ("-", "—", "–"):
+                return
+            score = cls._phone_value_score(s, key_name=key_name)
+            if score < 0:
+                return
+            candidates.append((score, -key_priority, val))
+
+        # 1) Bilinen dış-numara anahtarları
+        for i, k in enumerate(_PHONE_KEYS):
+            raw = cls._pick(row, (k,))
+            if raw is not None:
+                add(raw, key_name=k, key_priority=i)
+
+        # 2) Satırdaki telefon-benzeri tüm alanlar (Telefon Numarası vb.)
+        for key, val in row.items():
+            if val is None or val == "" or isinstance(val, (dict, list)):
+                continue
+            fk = cls._fold_key(str(key))
+            if cls._is_extension_key(fk):
+                add(val, key_name=str(key), key_priority=500)
+                continue
+            if not cls._key_looks_like_phone_field(fk):
+                continue
+            # zaten _PHONE_KEYS ile alındıysa tekrar eklemek skorlamada zararsız
+            add(val, key_name=str(key), key_priority=100)
+
+        # 3) Dahili alanlar — yedek
+        for i, k in enumerate(_EXTENSION_PHONE_KEYS):
+            raw = cls._pick(row, (k,))
+            if raw is not None:
+                add(raw, key_name=k, key_priority=1000 + i)
+
+        # 4) Hiç güçlü dış aday yoksa: tüm skaler değerlerde TR numara ara
+        if not any(score >= 50 for score, _, _ in candidates):
+            for key, val in row.items():
+                if val is None or val == "" or isinstance(val, (dict, list, bool)):
+                    continue
+                s = str(val).strip()
+                if not s or s in ("-", "—", "–"):
+                    continue
+                if normalize_tr_phone(s):
+                    add(s, key_name=str(key), key_priority=200)
+
+        if not candidates:
+            return None
+
+        # En yüksek skor; eşitlikte key_priority (daha erken / dış alan)
+        best = max(candidates, key=lambda t: (t[0], t[1]))
+        return best[2]
+
+    @staticmethod
+    def _is_extension_key(folded_key: str) -> bool:
+        fk = folded_key
+        if any(x in fk for x in ("dahili", "extension", "exten")):
+            # "external" false positive olmasın
+            if "external" in fk:
+                return False
+            return True
+        if fk in ("ext", "src") or fk.endswith("ext"):
+            return True
+        return False
+
+    @staticmethod
+    def _key_looks_like_phone_field(folded_key: str) -> bool:
+        fk = folded_key
+        if any(
+            x in fk
+            for x in (
+                "telefon",
+                "phone",
+                "msisdn",
+                "caller",
+                "callee",
+                "clid",
+                "cnum",
+                "dst",
+                "did",
+            )
+        ):
+            return True
+        if fk in ("number", "src", "dst"):
+            return True
+        if "numara" in fk and "dahili" not in fk:
+            return True
+        return False
+
+    @classmethod
+    def _phone_value_score(cls, value: str, *, key_name: str) -> int:
+        """Yüksek = dış hat / mobil; düşük = dahili."""
+        d = re.sub(r"\D+", "", value)
+        if not d:
+            return -1
+
+        fk = cls._fold_key(key_name)
+        ext_key = cls._is_extension_key(fk)
+
+        # TR normalize başarılı (90 + 10 hane, genelde 5xx)
+        norm = normalize_tr_phone(value)
+        if norm and len(norm) >= 12:
+            base = 100
+            # 5 ile başlayan mobil gövde
+            if norm[2:3] == "5":
+                base = 120
+            if ext_key:
+                return 20  # anahtar dahili ama değer uzun numara — şüpheli, düşük
+            return base
+
+        # 10+ hane (ülke kodu olmadan veya kirli format)
+        if len(d) >= 10:
+            if ext_key:
+                return 25
+            if d[-10:].startswith("5"):
+                return 90
+            return 70
+
+        # 7–9 hane: zayıf aday
+        if len(d) >= 7:
+            return 30 if not ext_key else 10
+
+        # 3–6 hane: neredeyse kesin dahili (605 vb.)
+        if 3 <= len(d) <= 6:
+            return 5 if ext_key else 8
+
+        return -1
 
     @classmethod
     def _extract_datetime(cls, row: dict[str, Any]) -> tuple[datetime, str, str]:
