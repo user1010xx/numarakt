@@ -197,8 +197,14 @@ class TonivaClient:
         # Çalışan phone filter param adı (keşfedilince cache); False = yok
         self._phone_filter_param: str | None | bool = None
         self._pagination_mode: str = "page"  # page | offset
-        self._api_lock = asyncio.Lock()
+        self._api_lock: asyncio.Lock | None = None
         self._command_priority = 0  # >0 iken arka plan sync yavaşlasın
+
+    def _lock(self) -> asyncio.Lock:
+        # Event loop içinde oluştur (startup crash / wrong loop önlemi)
+        if self._api_lock is None:
+            self._api_lock = asyncio.Lock()
+        return self._api_lock
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -707,12 +713,8 @@ class TonivaClient:
     async def _get_report(self, params: dict[str, Any]) -> Any:
         url = "/reports/conversations"
         last_err: Exception | None = None
-        # Komut öncelikli: kilit ile sıralı istek (rate limit / yarış yok)
-        async with self._api_lock:
+        async with self._lock():
             for attempt in range(3):
-                # Arka plan sync iken komut bekliyorsa kısa nefes
-                if self._command_priority == 0:
-                    await asyncio.sleep(0.05)
                 try:
                     resp = await self._client.get(url, params=params)
                 except httpx.HTTPError as exc:
@@ -721,10 +723,9 @@ class TonivaClient:
                 if resp.status_code == 429:
                     raw_retry = resp.headers.get("Retry-After", "2")
                     try:
-                        wait_s = max(1, min(8, int(float(raw_retry))))
+                        wait_s = max(1, min(5, int(float(raw_retry))))
                     except ValueError:
                         wait_s = 2
-                    # Komut sırasında uzun bekleme yapma
                     if self._command_priority > 0 and attempt >= 1:
                         raise RuntimeError(
                             f"Toniva rate limit (CRM-2094). Retry-After: {raw_retry} sn"

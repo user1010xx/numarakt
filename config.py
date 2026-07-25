@@ -72,5 +72,6 @@ def load_settings() -> Settings:
         timezone=(os.getenv("TZ") or "Europe/Istanbul").strip(),
         lookback_days=lookback_days,
         cache_path=(os.getenv("CACHE_PATH") or "data/calls.db").strip(),
-        cache_sync_on_start=_env_bool("CACHE_SYNC_ON_START", True),
+        # Varsayılan KAPALI: sync API'yi boğup /kt'yi kilitlemesin
+        cache_sync_on_start=_env_bool("CACHE_SYNC_ON_START", False),
     )

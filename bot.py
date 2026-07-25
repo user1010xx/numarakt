@@ -1,8 +1,8 @@
 """
-Toniva Görüşme Raporu kontrol botu.
+Toniva /kt bot — yalnızca gruplarda.
 
-Kullanım (yalnızca grup/supergroup):
   /kt 905551112233
+  /ping
 """
 
 from __future__ import annotations
@@ -10,14 +10,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import traceback
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from telegram import Update
 from telegram.constants import ChatType, ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
-from call_cache import CallCache
 from config import Settings, load_settings
 from phone_utils import normalize_tr_phone
 from toniva_client import TonivaClient
@@ -31,188 +37,167 @@ logger = logging.getLogger("kt-bot")
 _KT_RE = re.compile(r"^/kt(?:@\w+)?\s+(.+)$", re.IGNORECASE | re.DOTALL)
 
 
-def _is_group(chat_type: str) -> bool:
-    return chat_type in (ChatType.GROUP, ChatType.SUPERGROUP)
+def _esc(t: str) -> str:
+    return str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _chat_allowed(settings: Settings, chat_id: int) -> bool:
-    if not settings.allowed_chat_ids:
-        return True
-    return chat_id in settings.allowed_chat_ids
-
-
-def _lookback_range(settings: Settings) -> tuple:
+def _lookback(settings: Settings):
     tz = ZoneInfo(settings.timezone)
     today = datetime.now(tz).date()
-    start = today - timedelta(days=settings.lookback_days)
-    return start, today
+    return today - timedelta(days=settings.lookback_days), today
 
 
-def _esc(text: str) -> str:
-    return (
-        str(text)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-
-
-def _format_found(record, *, source: str = "") -> str:
-    src = f"\n🗄 <i>{_esc(source)}</i>" if source else ""
-    return (
-        f"👤 <b>Personel:</b> {_esc(record.agent_name)}\n"
-        f"📞 <b>Telefon:</b> {_esc(record.phone)}\n"
-        f"📅 <b>Son arama tarihi:</b> {_esc(record.call_date)}\n"
-        f"🕐 <b>Son arama saati:</b> {_esc(record.call_time)}"
-        f"{src}"
-    )
-
-
-async def kt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Her zaman önce kullanıcıya görünür yanıt ver; sonra ara."""
-    try:
-        await _kt_command_impl(update, context)
-    except Exception:
-        logger.exception("kt_command beklenmeyen hata")
-        try:
-            if update.effective_message:
-                await update.effective_message.reply_text(
-                    "⚠️ Beklenmeyen hata. Loglara bakın / tekrar deneyin."
-                )
-        except Exception:
-            pass
-
-
-async def _kt_command_impl(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    settings: Settings = context.application.bot_data["settings"]
-    client: TonivaClient = context.application.bot_data["toniva"]
-
-    if not update.effective_chat or not update.effective_message:
+async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sağlık kontrolü — her yerde yanıt verir."""
+    if not update.effective_message:
         return
-
     chat = update.effective_chat
-    msg = update.effective_message
-
-    if not _is_group(chat.type):
-        # Sessiz kalma — kullanıcı "yanıt yok" sanmasın
-        await msg.reply_text("Bu bot yalnızca grup sohbetlerinde çalışır. /kt …")
-        return
-
-    if not _chat_allowed(settings, chat.id):
-        logger.info("İzin listesinde olmayan grup chat_id=%s", chat.id)
-        await msg.reply_text("Bu grup için bot yetkili değil.")
-        return
-
-    args = context.args or []
-    raw_phone = " ".join(args).strip() if args else ""
-    if not raw_phone and msg.text:
-        m = _KT_RE.match(msg.text.strip())
-        if m:
-            raw_phone = m.group(1).strip()
-
-    if not raw_phone:
-        await msg.reply_text(
-            "Kullanım: <code>/kt 905551112233</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    normalized = normalize_tr_phone(raw_phone)
-    if not normalized:
-        await msg.reply_text(
-            "Geçersiz numara.\nÖrnek: <code>/kt 905551112233</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    start, end = _lookback_range(settings)
-
-    # Hemen yanıt — kullanıcı boş beklememeli
-    wait = await msg.reply_text(
-        f"🔍 Aranıyor…\n<code>{_esc(normalized)}</code>",
-        parse_mode=ParseMode.HTML,
+    await update.effective_message.reply_text(
+        f"pong ✅ chat={chat.id if chat else '?'} type={chat.type if chat else '?'}"
     )
 
-    async def on_progress(text: str) -> None:
-        try:
+
+async def kt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat:
+        logger.warning("kt: message/chat yok")
+        return
+
+    logger.info(
+        "kt alındı chat_id=%s type=%s user=%s text=%r",
+        chat.id,
+        chat.type,
+        update.effective_user.id if update.effective_user else None,
+        (msg.text or "")[:80],
+    )
+
+    # Hemen görünür yanıt (grup/özel fark etmez — sessiz kalma)
+    try:
+        wait = await msg.reply_text("🔍 Aranıyor…")
+    except Exception:
+        logger.exception("İlk reply başarısız")
+        return
+
+    try:
+        settings: Settings = context.application.bot_data["settings"]
+        client: TonivaClient = context.application.bot_data["toniva"]
+
+        # Grup kısıtı
+        if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+            await wait.edit_text("Bu komut yalnızca gruplarda çalışır.")
+            return
+
+        if settings.allowed_chat_ids and chat.id not in settings.allowed_chat_ids:
             await wait.edit_text(
-                f"🔍 {_esc(text)}\n<code>{_esc(normalized)}</code>",
+                f"Bu grup yetkili değil.\nchat_id: <code>{chat.id}</code>",
                 parse_mode=ParseMode.HTML,
             )
-        except Exception:
-            pass
+            return
 
-    try:
-        result = await client.find_latest_call(
-            normalized,
-            start,
-            end,
-            on_progress=on_progress,
-            timeout_sec=25.0,
+        args = context.args or []
+        raw = " ".join(args).strip()
+        if not raw and msg.text:
+            m = _KT_RE.match(msg.text.strip())
+            if m:
+                raw = m.group(1).strip()
+
+        if not raw:
+            await wait.edit_text(
+                "Kullanım: <code>/kt 905551112233</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        phone = normalize_tr_phone(raw)
+        if not phone:
+            await wait.edit_text(
+                "Geçersiz numara. Örnek: <code>/kt 905551112233</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        await wait.edit_text(
+            f"🔍 Aranıyor…\n<code>{_esc(phone)}</code>",
+            parse_mode=ParseMode.HTML,
         )
-    except Exception as exc:
-        logger.exception("Sorgulama hatası")
-        await wait.edit_text(f"⚠️ Sorgulanamadı: {_esc(str(exc))}")
-        return
 
-    if result.record is None:
-        lines = [
-            "❌ <b>BULUNAMADI</b>",
-            f"Numara: <code>{_esc(normalized)}</code>",
-            f"Aralık: {start.isoformat()} → {end.isoformat()}",
-        ]
-        if result.note:
-            lines.append(f"Not: {_esc(result.note)}")
-        if result.source:
-            lines.append(f"Kaynak: {_esc(result.source)}")
-        cache: CallCache | None = context.application.bot_data.get("cache")
-        if cache is not None:
+        start, end = _lookback(settings)
+
+        async def progress(text: str) -> None:
             try:
-                st = cache.stats()
-                lines.append(f"Önbellek: {st.row_count} kayıt")
+                await wait.edit_text(
+                    f"🔍 {_esc(text)}\n<code>{_esc(phone)}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
             except Exception:
                 pass
-        await wait.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
-        return
 
-    await wait.edit_text(
-        _format_found(result.record, source=result.source or result.note),
-        parse_mode=ParseMode.HTML,
-    )
+        result = await client.find_latest_call(
+            phone, start, end, on_progress=progress, timeout_sec=20.0
+        )
+
+        if result.record is None:
+            note = result.note or "kayıt yok"
+            await wait.edit_text(
+                f"❌ <b>BULUNAMADI</b>\n"
+                f"Numara: <code>{_esc(phone)}</code>\n"
+                f"Aralık: {start} → {end}\n"
+                f"Not: {_esc(note)}",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        r = result.record
+        src = f"\n🗄 {_esc(result.source)}" if result.source else ""
+        await wait.edit_text(
+            f"👤 <b>Personel:</b> {_esc(r.agent_name)}\n"
+            f"📞 <b>Telefon:</b> {_esc(r.phone)}\n"
+            f"📅 <b>Son arama tarihi:</b> {_esc(r.call_date)}\n"
+            f"🕐 <b>Son arama saati:</b> {_esc(r.call_time)}"
+            f"{src}",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as exc:
+        logger.exception("kt hata")
+        err = f"{type(exc).__name__}: {exc}"
+        try:
+            await wait.edit_text(f"⚠️ Hata: {_esc(err)[:500]}")
+        except Exception:
+            try:
+                await msg.reply_text(f"⚠️ Hata: {err[:500]}")
+            except Exception:
+                pass
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Update hatası: %s", context.error, exc_info=context.error)
+    logger.error("PTB error: %s", context.error, exc_info=context.error)
 
 
 async def post_init(app: Application) -> None:
-    me = await app.bot.get_me()
-    logger.info("Bot hazır: @%s (id=%s)", me.username, me.id)
+    try:
+        me = await app.bot.get_me()
+        logger.info("Bot online: @%s id=%s", me.username, me.id)
+    except Exception:
+        logger.exception("get_me başarısız — token kontrol edin")
+        raise
 
+    # Arka plan sync: varsayılan KAPALI (rate limit / takılma olmasın)
     settings: Settings = app.bot_data["settings"]
     client: TonivaClient = app.bot_data["toniva"]
-    cache: CallCache | None = app.bot_data.get("cache")
+    if settings.cache_sync_on_start and client.cache is not None:
+        async def _sync() -> None:
+            try:
+                start, end = _lookback(settings)
+                logger.info("Cache sync (son 2 gün)…")
+                await client.sync_to_cache(start, end, max_days=2)
+                logger.info("Cache sync bitti")
+            except Exception:
+                logger.exception("cache sync hata")
 
-    if cache is None or not settings.cache_sync_on_start:
-        logger.info("Cache sync kapalı veya cache yok")
-        return
-
-    async def _bg_sync() -> None:
-        try:
-            # Önce son 3 gün (hızlı ısınma), sonra kalan lookback
-            start, end = _lookback_range(settings)
-            logger.info("Cache sync faz1: son 3 gün")
-            await client.sync_to_cache(start, end, max_days=3)
-            logger.info("Cache sync faz2: tam aralık (yavaş)")
-            await client.sync_to_cache(start, end)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Arka plan cache sync hata")
-
-    app.bot_data["sync_task"] = asyncio.create_task(_bg_sync())
+        app.bot_data["sync_task"] = asyncio.create_task(_sync())
+    else:
+        logger.info("Cache sync kapalı (CACHE_SYNC_ON_START=false)")
 
 
 async def post_shutdown(app: Application) -> None:
@@ -223,24 +208,29 @@ async def post_shutdown(app: Application) -> None:
             await task
         except asyncio.CancelledError:
             pass
-    client: TonivaClient | None = app.bot_data.get("toniva")
+    client = app.bot_data.get("toniva")
     if client:
         await client.aclose()
-        logger.info("Toniva client kapatıldı")
 
 
 def main() -> None:
-    settings = load_settings()
-
-    cache: CallCache | None = None
     try:
-        cache = CallCache(settings.cache_path)
-        logger.info("Cache açıldı: %s rows=%s", settings.cache_path, cache.stats().row_count)
+        settings = load_settings()
+    except SystemExit as e:
+        logger.error("Ayar hatası: %s", e)
+        raise
     except Exception:
-        logger.exception(
-            "Cache açılamadı (%s) — önbelleksiz devam", settings.cache_path
-        )
-        cache = None
+        logger.exception("load_settings patladı")
+        raise
+
+    cache = None
+    try:
+        from call_cache import CallCache
+
+        cache = CallCache(settings.cache_path)
+        logger.info("Cache OK path=%s rows=%s", settings.cache_path, cache.stats().row_count)
+    except Exception:
+        logger.exception("Cache yok, devam (önbelleksiz)")
 
     client = TonivaClient(
         api_key=settings.toniva_api_key,
@@ -253,24 +243,31 @@ def main() -> None:
         .token(settings.telegram_bot_token)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
+        .concurrent_updates(True)
         .build()
     )
     app.bot_data["settings"] = settings
     app.bot_data["toniva"] = client
     app.bot_data["cache"] = cache
 
-    app.add_handler(CommandHandler("kt", kt_command))
+    app.add_handler(CommandHandler("ping", ping_cmd))
+    app.add_handler(CommandHandler("kt", kt_cmd))
+    # Privacy mode / mention fallback: "/kt@Bot 05..." text
+    app.add_handler(
+        MessageHandler(filters.Regex(r"(?i)^/kt(?:@\w+)?(?:\s|$)"), kt_cmd)
+    )
     app.add_error_handler(on_error)
 
     logger.info(
-        "Polling başlıyor lookback=%s cache=%s",
+        "Polling… lookback=%s allowed=%s",
         settings.lookback_days,
-        "on" if cache else "off",
+        sorted(settings.allowed_chat_ids) if settings.allowed_chat_ids else "ALL",
     )
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+    try:
+        app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    except Exception:
+        logger.error("run_polling crash:\n%s", traceback.format_exc())
+        raise
 
 
 if __name__ == "__main__":
