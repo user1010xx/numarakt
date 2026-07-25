@@ -194,9 +194,11 @@ class TonivaClient:
         )
         self._logged_schema = False
         self.cache = cache
-        # Çalışan phone filter param adı (keşfedilince cache)
-        self._phone_filter_param: str | None = None
+        # Çalışan phone filter param adı (keşfedilince cache); False = yok
+        self._phone_filter_param: str | None | bool = None
         self._pagination_mode: str = "page"  # page | offset
+        self._api_lock = asyncio.Lock()
+        self._command_priority = 0  # >0 iken arka plan sync yavaşlasın
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -211,49 +213,79 @@ class TonivaClient:
         start: date,
         end: date,
         on_progress: ProgressCb = None,
+        timeout_sec: float = 25.0,
     ) -> SearchResult:
         """
-        Hızlı arama sırası:
-        1) Yerel SQLite cache (anında)
-        2) API phone filtresi (denenen query param — 1 istek)
-        3) Günden geriye tarama (bugün→start), ilk eşleşmede dur
+        Hızlı arama (max ~timeout_sec):
+        1) Cache
+        2) Tek phone filter denemesi (biliniyorsa)
+        3) Son N günü tarama, bulunca dur
         """
         target = normalize_tr_phone(phone) or phone
+        self._command_priority += 1
+        try:
+            return await asyncio.wait_for(
+                self._find_latest_call_inner(target, start, end, on_progress),
+                timeout=timeout_sec,
+            )
+        except asyncio.TimeoutError:
+            # Timeout'ta cache'e son bir bakış
+            if self.cache is not None:
+                cached = self.cache.find_latest(target)
+                if cached is not None and start <= cached.sort_key.date() <= end:
+                    return SearchResult(
+                        record=cached,
+                        match_count=1,
+                        source="cache",
+                        note="zaman aşımı — önbellek sonucu",
+                        meta_summary={"timeout": True},
+                    )
+            return SearchResult(
+                record=None,
+                source="timeout",
+                note=f"Arama {int(timeout_sec)} sn içinde bitmedi",
+                meta_summary={"timeout": True},
+            )
+        finally:
+            self._command_priority = max(0, self._command_priority - 1)
 
-        # 1) API phone filtresi (varsa 1 istek ≈ saniyeler)
-        if on_progress:
-            await _safe_progress(on_progress, "API numara filtresi…")
-        filtered = await self._search_with_phone_filter(target, start, end)
-        if filtered is not None:
-            if filtered.record and self.cache is not None:
-                self.cache.upsert_records([filtered.record])
-            return filtered
-
-        # 2) Yerel SQLite (senkron sonrası anında)
+    async def _find_latest_call_inner(
+        self,
+        target: str,
+        start: date,
+        end: date,
+        on_progress: ProgressCb,
+    ) -> SearchResult:
+        # 1) Cache — anında
         if self.cache is not None:
             cached = self.cache.find_latest(target)
             if cached is not None and start <= cached.sort_key.date() <= end:
                 if on_progress:
                     await _safe_progress(on_progress, "Önbellekten bulundu")
-                logger.info(
-                    "Cache hit: phone=%s agent=%s %s %s",
-                    cached.phone,
-                    cached.agent_name,
-                    cached.call_date,
-                    cached.call_time,
-                )
                 return SearchResult(
                     record=cached,
-                    row_count=0,
                     match_count=1,
                     source="cache",
                     note="yerel önbellek",
                     meta_summary={"source": "cache"},
                 )
 
-        # 3) Günden geriye tarama; eşleşince çık
+        # 2) Phone filter — en fazla 1–2 istek (daha önce keşfedildiyse)
+        if self._phone_filter_param is not False:
+            if on_progress:
+                await _safe_progress(on_progress, "API sorgulanıyor…")
+            filtered = await self._search_with_phone_filter(target, start, end)
+            if filtered is not None:
+                if filtered.record and self.cache is not None:
+                    try:
+                        self.cache.upsert_records([filtered.record])
+                    except Exception:
+                        logger.exception("cache yazılamadı")
+                return filtered
+
+        # 3) Gün gün (yeniden eskiye), eşleşince çık
         if on_progress:
-            await _safe_progress(on_progress, "Gün gün taranıyor…")
+            await _safe_progress(on_progress, "Günler taranıyor…")
         return await self._search_day_by_day(target, start, end, on_progress)
 
     async def _search_with_phone_filter(
@@ -263,34 +295,18 @@ class TonivaClient:
         end: date,
     ) -> SearchResult | None:
         """
-        Belgelenmemiş phone query param dene.
-        Filtre yok sayılıyorsa (çok satır / karışık numaralar) None dön.
+        En fazla 2 deneme. Filtre yoksa bir daha denemez (_phone_filter_param=False).
         """
-        candidates: list[tuple[str, str]] = []
-        if self._phone_filter_param:
-            candidates.append((self._phone_filter_param, target))
-        else:
-            for key in (
-                "phone",
-                "Phone",
-                "phoneNumber",
-                "phone_number",
-                "search",
-                "q",
-                "number",
-                "msisdn",
-            ):
-                candidates.append((key, target))
-                # 05… ve son 10 hane varyantları
-                if target.startswith("90") and len(target) >= 12:
-                    candidates.append((key, "0" + target[2:]))
-                    candidates.append((key, target[-10:]))
+        if self._phone_filter_param is False:
+            return None
 
-        tried: set[tuple[str, str]] = set()
+        if isinstance(self._phone_filter_param, str):
+            candidates = [(self._phone_filter_param, target)]
+        else:
+            # İlk keşif: sadece 2 makul param — 24 istek YOK
+            candidates = [("phone", target), ("Phone", target)]
+
         for key, val in candidates:
-            if (key, val) in tried:
-                continue
-            tried.add((key, val))
             try:
                 data = await self._get_report(
                     {
@@ -302,84 +318,65 @@ class TonivaClient:
                     }
                 )
             except RuntimeError as exc:
-                # 400 = bilinmeyen param olabilir
                 if "400" in str(exc):
                     continue
-                raise
+                # 429 vs. — filtreyi kapatma, sadece bu turu atla
+                logger.warning("phone filter istek hata: %s", exc)
+                return None
 
             rows = self._extract_rows(data)
             meta = self._extract_meta(data)
             total = self._meta_total_count(meta)
 
-            if not rows:
-                # total=0 → filtre çalışıyor ve kayıt yok
-                if total == 0:
-                    self._phone_filter_param = key
-                    return SearchResult(
-                        record=None,
-                        row_count=0,
-                        meta_summary={**meta, "filter": key, "filter_value": val},
-                        note=f"API filtre ({key}) ile 0 sonuç",
-                        source="phone_filter",
-                    )
-                continue
-
-            # Filtre gerçekten daralttı mı?
-            matches = []
+            matches: list[CallRecord] = []
             other = 0
             for row in rows:
                 if not isinstance(row, dict):
                     continue
-                flat = self._flatten_row(row)
-                rec = self._match_row_to_phone(flat, target)
+                rec = self._match_row_to_phone(self._flatten_row(row), target)
                 if rec:
                     matches.append(rec)
                 else:
                     other += 1
 
-            # Karışık numaralar + yüksek total → param yok sayılmış
-            if total is not None and total > 500 and other > max(3, len(matches)):
-                logger.debug("phone filter yok sayıldı: key=%s total=%s", key, total)
-                continue
-            if other > len(matches) and len(rows) >= 10:
+            # Param yok sayılmış (devasa total + karışık numaralar)
+            if (total is not None and total > 500) or (
+                len(rows) >= 10 and other > len(matches)
+            ):
+                logger.info(
+                    "phone filter yok sayıldı key=%s total=%s rows=%s",
+                    key,
+                    total,
+                    len(rows),
+                )
                 continue
 
             if matches:
                 self._phone_filter_param = key
                 latest = max(matches, key=lambda r: r.sort_key)
-                logger.info(
-                    "Phone filter OK key=%s agent=%s %s %s",
-                    key,
-                    latest.agent_name,
-                    latest.call_date,
-                    latest.call_time,
-                )
                 return SearchResult(
                     record=latest,
                     row_count=len(rows),
-                    parsed_count=len(matches),
                     match_count=len(matches),
-                    meta_summary={
-                        **meta,
-                        "filter": key,
-                        "filter_value": val,
-                        "total_count": total,
-                    },
+                    meta_summary={**meta, "filter": key, "total_count": total},
                     source="phone_filter",
                     note=f"API filtre: {key}",
                 )
 
-            # Filtre çalıştı, bu numaraya ait yok
-            if total is not None and total <= 50 and other == 0:
+            if total == 0 or (not rows and total is not None and total < 100):
                 self._phone_filter_param = key
                 return SearchResult(
                     record=None,
-                    row_count=len(rows),
+                    row_count=0,
                     meta_summary={**meta, "filter": key},
-                    note=f"API filtre ({key}) sonuç verdi ama numara yok",
+                    note=f"API filtre ({key}) 0 sonuç",
                     source="phone_filter",
                 )
 
+        # Keşif başarısız — bir daha deneme
+        if not isinstance(self._phone_filter_param, str):
+            self._phone_filter_param = False
+            logger.info("API phone filtresi yok; cache+gün taraması kullanılacak")
         return None
 
     async def _search_day_by_day(
@@ -596,8 +593,15 @@ class TonivaClient:
         start: date,
         end: date,
         on_progress: ProgressCb = None,
+        *,
+        max_days: int | None = None,
     ) -> dict[str, Any]:
-        """Tarih aralığını cache'e yazar (arka plan)."""
+        """
+        Tarih aralığını cache'e yazar (arka plan).
+
+        max_days: sadece en son N gün (hızlı ısınma). Komut gelince
+        (_command_priority>0) kısa bekler, API'yi boğmaz.
+        """
         if self.cache is None:
             return {"ok": False, "error": "no cache"}
 
@@ -606,17 +610,25 @@ class TonivaClient:
         while d >= start:
             days.append(d)
             d -= timedelta(days=1)
+        if max_days is not None:
+            days = days[: max(1, max_days)]
 
         total_upserted = 0
         for i, day in enumerate(days):
+            # /kt çalışırken sync'i yavaşlat
+            while self._command_priority > 0:
+                await asyncio.sleep(0.5)
             if on_progress:
                 await _safe_progress(
                     on_progress,
                     f"Önbellek senkron: {day.isoformat()} ({i + 1}/{len(days)})",
                 )
-            # Günü tam çek (eşleşme aramadan)
-            n = await self._ingest_day(day)
-            total_upserted += n
+            try:
+                n = await self._ingest_day(day)
+                total_upserted += n
+            except Exception:
+                logger.exception("sync gün hatası %s", day)
+            await asyncio.sleep(0.2)
 
         self.cache.set_meta(
             "last_sync_at",
@@ -629,8 +641,8 @@ class TonivaClient:
             "Cache sync bitti: upsert~%s rows_in_db=%s range=%s→%s",
             total_upserted,
             stats.row_count,
-            start,
-            end,
+            days[-1] if days else start,
+            days[0] if days else end,
         )
         return {
             "ok": True,
@@ -638,6 +650,7 @@ class TonivaClient:
             "db_rows": stats.row_count,
             "start": start.isoformat(),
             "end": end.isoformat(),
+            "days": len(days),
         }
 
     async def _ingest_day(self, day: date) -> int:
@@ -694,31 +707,45 @@ class TonivaClient:
     async def _get_report(self, params: dict[str, Any]) -> Any:
         url = "/reports/conversations"
         last_err: Exception | None = None
-        for attempt in range(5):
-            try:
-                resp = await self._client.get(url, params=params)
-            except httpx.HTTPError as exc:
-                raise RuntimeError(f"Toniva API bağlantı hatası: {exc}") from exc
-
-            if resp.status_code == 429:
-                raw_retry = resp.headers.get("Retry-After", "2")
+        # Komut öncelikli: kilit ile sıralı istek (rate limit / yarış yok)
+        async with self._api_lock:
+            for attempt in range(3):
+                # Arka plan sync iken komut bekliyorsa kısa nefes
+                if self._command_priority == 0:
+                    await asyncio.sleep(0.05)
                 try:
-                    wait_s = max(1, min(20, int(float(raw_retry))))
-                except ValueError:
-                    wait_s = 2
-                logger.warning("429 rate limit, %ss (deneme %s)", wait_s, attempt + 1)
-                await asyncio.sleep(wait_s)
-                last_err = RuntimeError(f"Toniva rate limit. Retry-After: {raw_retry}")
-                continue
+                    resp = await self._client.get(url, params=params)
+                except httpx.HTTPError as exc:
+                    raise RuntimeError(f"Toniva API bağlantı hatası: {exc}") from exc
 
-            if resp.status_code >= 400:
-                detail = resp.text[:300]
-                raise RuntimeError(f"Toniva API hata {resp.status_code}: {detail}")
+                if resp.status_code == 429:
+                    raw_retry = resp.headers.get("Retry-After", "2")
+                    try:
+                        wait_s = max(1, min(8, int(float(raw_retry))))
+                    except ValueError:
+                        wait_s = 2
+                    # Komut sırasında uzun bekleme yapma
+                    if self._command_priority > 0 and attempt >= 1:
+                        raise RuntimeError(
+                            f"Toniva rate limit (CRM-2094). Retry-After: {raw_retry} sn"
+                        )
+                    logger.warning("429 rate limit, %ss (deneme %s)", wait_s, attempt + 1)
+                    await asyncio.sleep(wait_s)
+                    last_err = RuntimeError(
+                        f"Toniva rate limit. Retry-After: {raw_retry}"
+                    )
+                    continue
 
-            try:
-                return resp.json()
-            except ValueError as exc:
-                raise RuntimeError("Toniva API geçersiz JSON") from exc
+                if resp.status_code >= 400:
+                    detail = resp.text[:300]
+                    raise RuntimeError(
+                        f"Toniva API hata {resp.status_code}: {detail}"
+                    )
+
+                try:
+                    return resp.json()
+                except ValueError as exc:
+                    raise RuntimeError("Toniva API geçersiz JSON") from exc
 
         raise last_err or RuntimeError("Toniva rate limit")
 

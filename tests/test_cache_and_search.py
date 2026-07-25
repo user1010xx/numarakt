@@ -66,7 +66,7 @@ def test_live_schema_parse():
 
 
 @pytest.mark.asyncio
-async def test_find_uses_cache_after_filter_miss(cache: CallCache):
+async def test_find_uses_cache_first(cache: CallCache):
     cache.upsert_records(
         [
             CallRecord(
@@ -81,23 +81,10 @@ async def test_find_uses_cache_after_filter_miss(cache: CallCache):
     )
     client = TonivaClient(api_key="x", cache=cache)
 
-    async def fake_get(params):
-        # filtre yok sayılmış gibi büyük/karışık sonuç
-        return {
-            "meta": {"total_count": 90000},
-            "rows": [
-                {
-                    "Phone": "905452890657",
-                    "ExtensionName": "x",
-                    "CreateDate": "2026-07-25",
-                    "CreateTime": "10:00:00",
-                    "CallID": "n",
-                }
-            ]
-            * 20,
-        }
+    async def boom(params):
+        raise AssertionError("cache hit iken API çağrılmamalı")
 
-    client._get_report = fake_get  # type: ignore
+    client._get_report = boom  # type: ignore
 
     result = await client.find_latest_call(
         "905466033161", date(2026, 6, 25), date(2026, 7, 25)
@@ -157,24 +144,13 @@ async def test_phone_filter_path(cache: CallCache):
 @pytest.mark.asyncio
 async def test_day_scan_early_exit():
     client = TonivaClient(api_key="x")
+    # filtre yok — doğrudan gün taraması
+    client._phone_filter_param = False
     scan_pages: dict[str, int] = {}
 
     async def fake_get(params):
-        # phone filter denemeleri (pageSize=50) → boş / etkisiz
-        if int(params.get("pageSize") or 0) == 50:
-            return {"meta": {"total_count": 50000}, "rows": [
-                {
-                    "Phone": "905452890657",
-                    "ExtensionName": "x",
-                    "CreateDate": "2026-07-25",
-                    "CreateTime": "10:00:00",
-                    "CallID": "noise",
-                }
-            ]}
-
         day = params["startDate"]
         page = int(params.get("page") or 1)
-        # sadece tek-gün taramasını say
         if params.get("startDate") == params.get("endDate"):
             scan_pages[day] = scan_pages.get(day, 0) + 1
 
@@ -211,7 +187,6 @@ async def test_day_scan_early_exit():
     assert result.record is not None
     assert result.record.agent_name == "asu"
     assert result.source == "scan"
-    # 22 ve 21 tarandı; 20'ye inilmemeli (early exit)
     assert "2026-07-20" not in scan_pages
     assert scan_pages.get("2026-07-21", 0) == 2
 
